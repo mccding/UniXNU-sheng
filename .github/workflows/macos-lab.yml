@@ -60,6 +60,19 @@ jobs:
           new = 'static const char wanted[] = "macos";'
           assert old in s, 'wanted[] not found in RootLayout.h'
           p.write_text(s.replace(old, new, 1))
+
+          # Fix upstream Ath12kWifi fetch-sources.py when a moving branch (e.g. FreeBSD releng/15.1) advances past the locked commit
+          fp = Path('device/drivers/Ath12kWifi/tools/fetch-sources.py')
+          fs = fp.read_text()
+          f_old = '    revision = git(directory, "rev-parse", "HEAD")\n'
+          f_new = (
+              '    if not check_only and git(directory, "rev-parse", "HEAD") != source["commit"]:\n'
+              '        subprocess.run(["git", "-C", str(directory), "fetch", "--depth", "1", "origin", source["commit"]], check=True)\n'
+              '        subprocess.run(["git", "-C", str(directory), "checkout", "--detach", "FETCH_HEAD"], check=True)\n'
+              '    revision = git(directory, "rev-parse", "HEAD")\n'
+          )
+          assert f_old in fs, 'revision check not found in Ath12kWifi fetch-sources.py'
+          fp.write_text(fs.replace(f_old, f_new, 1))
           PY
       - name: Check out core sources
         uses: actions/checkout@v4
