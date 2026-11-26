@@ -138,8 +138,8 @@ struct Keyboard {
     volatile uint32_t capsWanted, capsRequests;
     // Thread state.
     uint32_t hallSeen, capsSeen;
-    bool attached, inputEnabled, lid, tablet, caps, hallPending;
-    uint64_t hallDue, hallPoll;   // milliseconds
+    bool attached, inputEnabled, lid, tablet, caps, hallPending, detachPending;
+    uint64_t hallDue, hallPoll, detachDueMs;   // milliseconds
     KeyboardService service;
     IOService *hid;
     bool classRegistered;
@@ -475,9 +475,10 @@ bool applyInputState() {
 void attachCover() {
     Keyboard *kb = gKb;
     kb->attached = true;
+    kb->detachPending = false;
     kb->caps = false;                 // the controller keeps the Caps Lock LED between attaches; the system starts with it off
     kb->service.statePending = true;
-    kb->hid = createHid();
+    if (!kb->hid) kb->hid = createHid();
     if (kb->hid) sheng_keyboard_cover_enable(kb->hid, kb->inputEnabled);
     else bump(8, 1 << 24);
     kb->service.keepalive = nowMs();
@@ -488,13 +489,12 @@ void attachCover() {
 void detachCover() {
     Keyboard *kb = gKb;
     kb->attached = false;
+    kb->detachPending = false;
     kb->service.statePending = false;
+    releaseInputs();
+    if (kb->hid) sheng_keyboard_cover_enable(kb->hid, false);
     if (sheng_battery_keyboard_attached) sheng_battery_keyboard_attached(0);
-    if (IOService *hid = kb->hid) {
-        kb->hid = nullptr;
-        hid->terminate();
-        hid->release();
-    }
+    // Keep kb->hid persistent across cover detach/re-attach so WindowServer/systemsettingsagent never churns.
     native_keyboard_stats[8] = native_keyboard_stats[8] & ~0xff;
 }
 
@@ -603,9 +603,19 @@ bool handleFrame() {
         }
         break;
     case Wn8030Attach:
-        if (f.attached == 1 && !kb->attached) attachCover();
-        else if (f.attached == 0 && kb->attached) detachCover();
-        else if (f.attached >= 0 && sheng_battery_keyboard_attached) sheng_battery_keyboard_attached(f.attached);
+        if (f.attached == 1) {
+            kb->detachPending = false;
+            if (!kb->attached) attachCover();
+            else if (sheng_battery_keyboard_attached) sheng_battery_keyboard_attached(1);
+        } else if (f.attached == 0 && kb->attached) {
+            releaseInputs();
+            if (!kb->detachPending) {
+                kb->detachPending = true;
+                kb->detachDueMs = nowMs() + 500;
+            }
+        } else if (f.attached >= 0 && sheng_battery_keyboard_attached) {
+            sheng_battery_keyboard_attached(f.attached);
+        }
         break;
     case Wn8030Accel:
         native_keyboard_accel[0] = f.x; native_keyboard_accel[1] = f.y; native_keyboard_accel[2] = f.z;
@@ -686,6 +696,10 @@ void serve() {
             native_keyboard_stats[9] = (native_keyboard_stats[9] & 3) | (int32_t)(hall << 8);
         }
         const uint64_t now = nowMs();
+        if (kb->detachPending && now >= kb->detachDueMs) {
+            kb->detachPending = false;
+            if (kb->attached) detachCover();
+        }
         if ((kb->hallPending && now >= kb->hallDue) || (!kb->hallPending && now >= kb->hallPoll)) {
             kb->hallPending = false;
             readHall();
@@ -700,12 +714,14 @@ void serve() {
         kb->service.step(io);
         const uint64_t next = kb->service.deadline(nowMs(), io.irqs());
         const uint64_t hallDeadline = kb->hallPending ? kb->hallDue : kb->hallPoll;
-        const uint64_t due = next < hallDeadline ? next : hallDeadline;
+        uint64_t due = next < hallDeadline ? next : hallDeadline;
+        if (kb->detachPending && kb->detachDueMs < due) due = kb->detachDueMs;
         const uint64_t current = nowMs();
         assert_wait_deadline((event_t)&gWake, THREAD_UNINT, deadlineMs(due > current ? (uint32_t)(due - current) : 1));
         if (kb->service.deadline(nowMs(), io.irqs()) <= nowMs() ||
             kb->hallSeen != __atomic_load_n(&kb->hallIrqs, __ATOMIC_ACQUIRE) ||
-            kb->capsSeen != __atomic_load_n(&kb->capsRequests, __ATOMIC_ACQUIRE))
+            kb->capsSeen != __atomic_load_n(&kb->capsRequests, __ATOMIC_ACQUIRE) ||
+            (kb->detachPending && nowMs() >= kb->detachDueMs))
             clear_wait(current_thread(), THREAD_AWAKENED);
         else thread_block(THREAD_CONTINUE_NULL);
     }

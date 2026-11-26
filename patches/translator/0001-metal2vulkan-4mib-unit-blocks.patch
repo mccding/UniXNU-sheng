@@ -1,0 +1,11 @@
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -38,7 +38,7 @@
+ /// 4.1 ms at the median and up to 19 ms, and 256 MiB for 93 ms at the median and up to 242 ms. So
+ /// allocations are short, and a take longer than one pays its own length
+ /// once: the allocation it makes, a long allocation, serves later takes of that length.
+-const ALLOCATION_LEN: u64 = 16 << 20;
++const ALLOCATION_LEN: u64 = 4 << 20;
+ 
+ /// A block's length, and its first byte's offset in its allocation, are multiples of this, or of
+ /// the device's `bufferImageGranularity` where that is larger: no block shares a page of that

@@ -107,6 +107,74 @@ jobs:
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime/data.dbr
             device/drivers/Ath12kWifi/deps
             device/.cache/firmware
+      - name: Apply Stage 1 12G RAM and GPU memory patches
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          mm = Path('uefi-sheng/Platforms/Xiaomi/shengPkg/Library/MemoryMapLib/MemoryMapLib.c')
+          mm_src = mm.read_text()
+          mm_subs = [
+              (
+                  'Fdt32ToCpu (ReadUnaligned32 (Value)) != 8',
+                  '(Fdt32ToCpu (ReadUnaligned32 (Value)) != 8 && Fdt32ToCpu (ReadUnaligned32 (Value)) != 12 && Fdt32ToCpu (ReadUnaligned32 (Value)) != 16)',
+              ),
+              (
+                  '(Base >= 0x880000000ULL && End <= 0xa00000000ULL)',
+                  '(Base >= 0x880000000ULL && End <= 0xc00000000ULL)',
+              ),
+              (
+                  'if (Base == 0x8c0000000ULL && End == 0xa00000000ULL) { HasHighBank = TRUE; }',
+                  'if (Base == 0x8c0000000ULL && End >= 0xa00000000ULL && End <= 0xc00000000ULL) { HasHighBank = TRUE; }',
+              ),
+              (
+                  '(Inputs[I].Base >= 0x880000000ULL && Inputs[I].End <= 0xa00000000ULL)',
+                  '(Inputs[I].Base >= 0x880000000ULL && Inputs[I].End <= 0xc00000000ULL)',
+              ),
+          ]
+          for old, new in mm_subs:
+              assert old in mm_src, f'missing in MemoryMapLib.c: {old}'
+              mm_src = mm_src.replace(old, new, 1)
+          mm.write_text(mm_src)
+
+          ws = Path('UniXNU/drivers/DarwinBoot/DarwinBootPkg/Driver/WindowSize.h')
+          ws_src = ws.read_text()
+          ws_old = 'size <= 0x200000000ULL'
+          ws_new = 'size <= 0x340000000ULL'
+          assert ws_old in ws_src, f'missing in WindowSize.h: {ws_old}'
+          ws.write_text(ws_src.replace(ws_old, ws_new, 1))
+
+          dt = Path('UniXNU/scripts/unixnu/devicetree.py')
+          dt_src = dt.read_text()
+          dt_old = '0x10000000 <= size <= 0x200000000'
+          dt_new = '0x10000000 <= size <= 0x340000000'
+          assert dt_old in dt_src, f'missing in devicetree.py: {dt_old}'
+          dt.write_text(dt_src.replace(dt_old, dt_new, 1))
+
+          patch_src = Path('device/patches/translator/0001-metal2vulkan-4mib-unit-blocks.patch').read_text().replace('\r\n', '\n')
+          patch_dir = Path('UniXNU/drivers/AdrenoMetal/bridge/patches')
+          patch_dir.mkdir(parents=True, exist_ok=True)
+          (patch_dir / '0001-metal2vulkan-4mib-unit-blocks.patch').write_text(patch_src, newline='\n')
+
+          bridge = Path('UniXNU/scripts/build-adreno-metal-bridge.py')
+          br_src = bridge.read_text()
+          empty_pat = "PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [\n]]"
+          if empty_pat in br_src:
+              br_src = br_src.replace(
+                  empty_pat,
+                  "PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [\n    '0001-metal2vulkan-4mib-unit-blocks.patch',\n]]",
+                  1,
+              )
+          elif "'0001-metal2vulkan-4mib-unit-blocks.patch'" not in br_src:
+              anchor = "PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in ["
+              pos = br_src.find(anchor)
+              assert pos != -1, 'PATCHES declaration not found in build-adreno-metal-bridge.py'
+              close = br_src.find('\n]]', pos)
+              assert close != -1, 'PATCHES closing bracket not found in build-adreno-metal-bridge.py'
+              br_src = br_src[:close] + "\n    '0001-metal2vulkan-4mib-unit-blocks.patch'," + br_src[close:]
+          bridge.write_text(br_src)
+          print('Applied Stage 1 UEFI/DarwinBoot/UniXNU/metal2vulkan patches.')
+          PY
       - name: Refresh pinned translator checkout
         run: |
           python3 - <<'PYTHON'
