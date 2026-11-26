@@ -50,6 +50,17 @@ jobs:
         with:
           path: device
           submodules: recursive
+      - name: Patch ShengUfs for dual-boot macos partition
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('device/drivers/ShengUfs/RootLayout.h')
+          s = p.read_text()
+          old = 'static const char wanted[] = "userdata";'
+          new = 'static const char wanted[] = "macos";'
+          assert old in s, 'wanted[] not found in RootLayout.h'
+          p.write_text(s.replace(old, new, 1))
+          PY
       - name: Check out core sources
         uses: actions/checkout@v4
         with:
