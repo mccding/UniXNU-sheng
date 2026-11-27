@@ -19,7 +19,7 @@ for source in sources:
     obj=out/(source.stem+'.o');cc=list(base);cc[cc.index('-xc')+1]=str(source);cc[cc.index('-o')+1]=str(obj)
     if '-MF' in cc:cc[cc.index('-MF')+1]=str(obj.with_suffix('.d'))
     cc += ['-I'+str(d) for d in (component/'include',component/'src',component/'shim',component/'out/linux',soc,tree/'kits/ArmSmmu4K')]
-    cc += ['-Wno-sign-compare']
+    cc += ['-Wno-sign-compare', '-Os']
     (out/(source.stem+'.command.json')).write_text(json.dumps(cc,indent=2)+'\n')
     result=subprocess.run(cc,cwd=cwd,text=True,capture_output=True)
     (out/(source.stem+'.log')).write_text(result.stdout+result.stderr)

@@ -530,10 +530,10 @@ for stem, extra in [('CpuFreqProbe', ()), ('ThermalProbe', ()), ('BoardClock', (
                     # GPU power, GMU and the Metal accelerator publication (gpu-power, gpu-metal), as on iPadOS 17.
                     ('GpuPowerProbe', tuple(x for d in ('drivers/Adreno740', 'kits/ArmSmmu4K', 'kits/AdrenoFirmware', 'kits/AdrenoPM4',
                                                         'kits/Sm8550Platform') for x in ('-I', str(ROOT / d))))]:
-    compile_cpp(KITS / (stem + '.cpp'), board_dir / (stem + '.o'), extra)
+    compile_cpp(KITS / (stem + '.cpp'), board_dir / (stem + '.o'), extra + ('-Os',))
     board_objects.append(board_dir / (stem + '.o'))
 for stem, extra in [('WifiNet', ('-I', str(WIFI / 'include'))), ('AppleARMBacklight', ()), ('ShengBattery', ()), ('ShengAudioService', ()), ('ThermalLevel', ())]:
-    compile_cpp(KITS / (stem + '.cpp'), board_dir / (stem + '.o'), extra)
+    compile_cpp(KITS / (stem + '.cpp'), board_dir / (stem + '.o'), extra + ('-Os',))
     run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', f'--globalize-symbol=__GLOBAL__sub_I_{stem}.cpp',
          board_dir / (stem + '.o'), board_dir / (stem + '.late.o')])
     board_objects.append(board_dir / (stem + '.late.o'))
@@ -655,7 +655,7 @@ for i in range(xhci_abi.get('base_slots', 168), len(xhci_slots)):
     xhci_header += f' virtual {m["returns"]} {m["name"]}({m["parameters"]});\n'
 xhci_header += f'}};\nstatic_assert(sizeof(AppleUSBXHCI)=={xhci_abi["instance_size"]},"Original controller instance size");\n'
 (USB_OUT / 'OriginalUsbXhciABI.h').write_text(xhci_header)
-usb_flags = ('-I', str(USB_OUT), '-I', str(USB), '-I', str(KITS))
+usb_flags = ('-I', str(USB_OUT), '-I', str(USB), '-I', str(KITS), '-Os')
 compile_cpp(USB / 'QcomDwc3.cpp', USB_OUT / 'QcomDwc3.o', usb_flags)
 compile_cpp(KITS / 'UsbProbe.cpp', USB_OUT / 'UsbProbe.o', usb_flags)
 usb_raw = (USB_OUT / 'QcomDwc3.o').read_bytes()
@@ -874,8 +874,8 @@ if MACOS:
     aes_late = AES_OUT / 'NativeAES.late.o'
     run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--globalize-symbol=__GLOBAL__sub_I_NativeAES.cpp',
          AES_OUT / 'NativeAES.o', aes_late])
-    compile_cpp(KITS / 'SoftwareAesProbe.cpp', AES_OUT / 'SoftwareAesProbe.o', ())
-    compile_cpp(KITS / 'DiagnosticDataStandIn.cpp', AES_OUT / 'DiagnosticDataStandIn.o', ())
+    compile_cpp(KITS / 'SoftwareAesProbe.cpp', AES_OUT / 'SoftwareAesProbe.o', ('-Os',))
+    compile_cpp(KITS / 'DiagnosticDataStandIn.cpp', AES_OUT / 'DiagnosticDataStandIn.o', ('-Os',))
     diag_late = AES_OUT / 'DiagnosticDataStandIn.late.o'
     run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func',
          '--globalize-symbol=__GLOBAL__sub_I_DiagnosticDataStandIn.cpp',
