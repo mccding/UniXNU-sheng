@@ -1,0 +1,68 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 765dd6f..66430ec 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -5033,15 +5033,13 @@ static void fillBaseLimits(id device);
+ // MPSCore reads the GPU core count of every Apple GPU family (no count: no MPS device, and its image cache is nil); the Adreno's
+ // shader processors count as eight cores, which only sizes MPS's kernel choices.
+ - (NSUInteger)gpuCoreCount {return 8;}
+-// A texture over a buffer starts where a linear texture may: the texel-buffer alignment the runtime answers for the linear one.
+-- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
+- return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
+-}
+-// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the linear
+-// texture alignment of the widest common format is the same rule this GPU applies to any linear image.
+-- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {
+- return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),MTLPixelFormatRGBA16Float);
+-}
++// Texel buffers (MTLTextureTypeTextureBuffer) must satisfy Adreno 740 Vulkan minTexelBufferOffsetAlignment (64 bytes).
++- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {(void)format;return 64;}
++// SPI: row alignment for textures over IOSurface planes. Runtime v2 check_over accepts any texel-aligned pitch and uses
++// Form::Copied for host-imported IOSurfaces; answering 16 (matching Apple Silicon) avoids rejecting WindowServer, Safari,
++// WebKit, Core Image and iconservicesagent IOSurfaces (e.g. 2816 B Volume HUD, 10592 B Safari, 160/288 B SF Symbols).
++- (NSUInteger)iosurfaceTextureAlignmentBytes {return 16;}
++- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {return 16;}
+ - (uint64_t)registryID {return gRegistryID;}
+ - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
+ - (BOOL)hasUnifiedMemory {return YES;}
+diff --git a/bridge/NativeMetalCapabilities.rs b/bridge/NativeMetalCapabilities.rs
+index 73574c3..5bd504b 100644
+--- a/bridge/NativeMetalCapabilities.rs
++++ b/bridge/NativeMetalCapabilities.rs
+@@ -80,27 +80,19 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String>
+             .min(l.max_fragment_output_attachments)
+             .min(8) as u64,
+         "minConstantBufferAlignmentBytes" => 4,
+-        "minimumLinearTextureAlignmentForPixelFormat:" => device
+-            .minimum_linear_texture_alignment(
+-                PixelFormat::try_from(narrow(arg)?).map_err(|_| "invalid pixel format")?,
+-            )
+-            .map_err(|e| format!("linear alignment: {e:?}"))?,
++        "minimumLinearTextureAlignmentForPixelFormat:" => {
++            let _ = device
++                .minimum_linear_texture_alignment(
++                    PixelFormat::try_from(narrow(arg)?).map_err(|_| "invalid pixel format")?,
++                )
++                .map_err(|e| format!("linear alignment: {e:?}"))?;
++            16
++        }
+         "deviceLinearReadOnlyTextureAlignmentBytes"
+         | "deviceLinearTextureAlignmentBytes"
+         | "linearTextureAlignmentBytes"
+         | "iosurfaceTextureAlignmentBytes"
+-        | "iosurfaceReadOnlyTextureAlignmentBytes" => [
+-            PixelFormat::BGRA8Unorm,
+-            PixelFormat::RGBA8Unorm,
+-            PixelFormat::RGBA16Float,
+-        ]
+-        .into_iter()
+-        .try_fold(16, |a, pf| {
+-            device
+-                .minimum_linear_texture_alignment(pf)
+-                .map(|b| a.max(b))
+-                .map_err(|e| format!("linear alignment: {e:?}"))
+-        })?,
++        | "iosurfaceReadOnlyTextureAlignmentBytes" => 16,
+         "maxVertexBuffers"
+         | "maxFragmentBuffers"
+         | "maxComputeBuffers"

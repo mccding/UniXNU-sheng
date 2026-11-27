@@ -22,7 +22,7 @@ static const struct {uint8_t opcode, property, slow;} kFields[BmFields] = {
     [BmUsbCurrent] = {SHENG_BATTMGR_OP_USB_GET, 3, 0},
     [BmTimeToEmpty] = {SHENG_BATTMGR_OP_BATTERY_GET, 21, 0},
     [BmTimeToFull] = {SHENG_BATTMGR_OP_BATTERY_GET, 20, 0},
-    /* the fuel gauges: remaining and full charge of each (mAh) */
+    /* the fuel gauges: remaining and full charge of each (uAh) */
     [BmGauge1Remaining] = {SHENG_BATTMGR_OP_BOARD_GET, 0x8a, 0},
     [BmGauge1Full] = {SHENG_BATTMGR_OP_BOARD_GET, 0x8b, 0},
     [BmGauge2Remaining] = {SHENG_BATTMGR_OP_BOARD_GET, 0xa6, 0},
@@ -267,7 +267,7 @@ void sheng_battmgr_snapshot(const ShengBattmgr *b, ShengBatterySnapshot *s)
     /* -40 to 90 C; the firmware answers a fixed out-of-range value when it has no reading */
     s->temperature_valid = HAS(BmTemperature) && V(BmTemperature) >= -4000 && V(BmTemperature) <= 9000;
     s->temperature = s->temperature_valid ? V(BmTemperature) : 0;
-    s->raw_mah = gauges && remaining > 0 ? (int)remaining : HAS(BmCharge) ? V(BmCharge) / 1000 : 0;
+    s->raw_mah = gauges && remaining > 0 ? (int)(remaining / 1000) : HAS(BmCharge) ? V(BmCharge) / 1000 : 0;
     s->full_mah = HAS(BmFull) ? V(BmFull) / 1000 : 0;
     s->design_mah = HAS(BmDesign) ? V(BmDesign) / 1000 : 0;
     s->cycles = HAS(BmCycles) ? V(BmCycles) : 0;

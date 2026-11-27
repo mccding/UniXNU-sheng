@@ -1899,7 +1899,7 @@ void gpuPerfTick(uint64_t busyTicks) {
 }
 void gpuDcvsThread(void *, wait_result_t) {
     ShengGmuIo &io = gColdDevice.io;
-    unsigned floor = bootArg("gpu-dcvs-min", 1);
+    unsigned floor = bootArg("gpu-dcvs-min", 2);
     if (floor < 1) floor = 1;
     if (floor > kGpuTop) floor = kGpuTop;
     io.write32(io.cookie, ShengGmuCore, kGmuReg(0x23b0e), 0xff000000u);
@@ -1923,9 +1923,9 @@ void gpuDcvsThread(void *, wait_result_t) {
     unsigned spanAt = 0, keptAt = 0, spanActive = 0;
     uint32_t seen = 0, seenBusy = 0, seenFaint = 0, seenRing = 0, longestUs = 0, longestMHz = 0;
     uint64_t boostAbs = 0, touchEnd = 0, wakeEnd = 0, wakeAbs = 0;
-    nanoseconds_to_absolutetime((uint64_t)bootArg("gpu-dcvs-boost-ms", 250) * 1000000, &boostAbs);
+    nanoseconds_to_absolutetime((uint64_t)bootArg("gpu-dcvs-boost-ms", 400) * 1000000, &boostAbs);
     nanoseconds_to_absolutetime(50000000ull, &wakeAbs);
-    const bool wakeBoost = bootArg("gpu-dcvs-wake", 0) != 0;
+    const bool wakeBoost = bootArg("gpu-dcvs-wake", 1) != 0;
     const bool thermalCapOn = bootArg("gpu-thermal-cap", 1) != 0;
     uint32_t touches = &native_hid_input_events ? native_hid_input_events[6] : 0;
     bool idle = false, atRest = false;

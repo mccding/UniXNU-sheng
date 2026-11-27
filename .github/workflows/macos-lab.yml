@@ -281,7 +281,66 @@ jobs:
               '}',
           ])
           assert rc_old in rc_src, 'missing hostQueryRead in RootCommands.h'
-          rc.write_text(rc_src.replace(rc_old, rc_new, 1))
+          rc_src = rc_src.replace(rc_old, rc_new, 1)
+          rc_rpmb_anchor = 'static IOReturn hostSyncCache (void)\n{\n  if (!gHost.ready || (!gStoreOpen && !gLogOpen)) return kIOReturnNotReady;\n  bool pooled;\n  const UfsSlot slot = hostSlotTake (&pooled);\n  uint8_t cdb[10] = { 0x35 };\n  uint32_t scsi = 0;\n  IOReturn status;\n  for (unsigned attempt = 0;; ++attempt) {\n    status = hostScsiDir (slot, 0, cdb, 10, 0, 0, 10000000, &scsi);\n    if (!hostRetryable (status, scsi, attempt)) break;\n  }\n  hostSlotGive (slot, pooled);\n  return status;\n}'
+          rc_rpmb_new = rc_rpmb_anchor + '\n' + '\n'.join([
+              '// Runtime UFS Read Descriptor (opcode 0x01) on a pooled slot: safe alongside active block I/O.',
+              'static IOReturn hostQueryReadDesc (uint8_t idn, uint8_t index, void *dst, uint32_t maxBytes, uint32_t *actualBytes)',
+              '{',
+              '  if (!gHost.ready || !dst || !maxBytes || maxBytes > 512 - 32) return kIOReturnBadArgument;',
+              '  bool pooled;',
+              '  const UfsSlot slot = hostSlotTake (&pooled);',
+              '  if (!hostClearUcd (slot)) { hostSlotGive (slot, pooled); return kIOReturnNotReady; }',
+              '  uint8_t *ucd = slot.ucd;',
+              '  const uint8_t tag = static_cast<uint8_t> (slot.entry);',
+              '  ucd[0] = 0x16;',
+              '  ucd[3] = tag;',
+              '  ucd[5] = 0x01;',
+              '  ucd[12] = 0x01;',
+              '  ucd[13] = idn;',
+              '  ucd[14] = index;',
+              '  ucd[18] = static_cast<uint8_t> (maxBytes >> 8);',
+              '  ucd[19] = static_cast<uint8_t> (maxBytes);',
+              '  uint32_t ocs = 0xf;',
+              '  IOReturn status = hostSubmit (slot, 0, 0, 500000, &ocs);',
+              '  if (status == kIOReturnSuccess) status = hostResponseHeader (slot, 0x36, 0, tag);',
+              '  if (status == kIOReturnSuccess) {',
+              '    const uint8_t *rsp = ucd + kRspOffset;',
+              '    if (rsp[12] != 0x01 || rsp[13] != idn || rsp[14] != index || rsp[15]) status = hostProtocolError (5);',
+              '    else if (rsp[6] != 0) status = kIOReturnError;',
+              '    else {',
+              '      uint32_t len = (uint32_t (rsp[10]) << 8) | rsp[11];',
+              '      if (len > maxBytes) len = maxBytes;',
+              '      if (len) memcpy (dst, rsp + 32, len);',
+              '      if (actualBytes) *actualBytes = len;',
+              '    }',
+              '  }',
+              '  hostSlotGive (slot, pooled);',
+              '  return status;',
+              '}',
+              '// Runtime SCSI command strictly on W-LUN 0xC4 (RPMB): TEST UNIT READY (0x00), SECURITY PROTOCOL IN (0xA2), SECURITY PROTOCOL OUT (0xB5).',
+              'static IOReturn hostRpmbScsi (const uint8_t *cdb, uint32_t cdbLen, unsigned direction, void *buf, uint32_t bytes, uint32_t *scsiStatus)',
+              '{',
+              '  if (!gHost.ready || !cdb || !cdbLen || cdbLen > 16 || direction > 2 || bytes > kDataMax || (bytes & 3) ||',
+              '      (bytes ? (!direction || !buf) : direction)) return kIOReturnBadArgument;',
+              '  if (cdb[0] != 0x00 && cdb[0] != 0xa2 && cdb[0] != 0xb5) return kIOReturnUnsupported;',
+              '  bool pooled;',
+              '  const UfsSlot slot = hostSlotTake (&pooled);',
+              '  if (direction == 1 && bytes) memcpy (slot.data, buf, bytes);',
+              '  uint32_t scsi = 0;',
+              '  IOReturn status;',
+              '  for (unsigned attempt = 0;; ++attempt) {',
+              '    status = hostScsiDir (slot, 0xc4, cdb, cdbLen, direction, bytes, 2000000, &scsi);',
+              '    if (!hostRetryable (status, scsi, attempt)) break;',
+              '  }',
+              '  if (scsiStatus) *scsiStatus = scsi;',
+              '  if (status == kIOReturnSuccess && direction == 2 && bytes) memcpy (buf, slot.data, bytes);',
+              '  hostSlotGive (slot, pooled);',
+              '  return status;',
+              '}',
+          ])
+          assert rc_rpmb_anchor in rc_src, 'missing hostSyncCache in RootCommands.h'
+          rc.write_text(rc_src.replace(rc_rpmb_anchor, rc_rpmb_new, 1))
 
           disk_id_text = Path('device/package/PianoDiskIdentity.h').read_text()
           Path('device/drivers/ShengUfs/PianoDiskIdentity.h').write_text(disk_id_text)
@@ -393,7 +452,21 @@ jobs:
               '  RootLayout *layout',
           ])
           assert nu_root_old in nu_src, 'missing startRoot anchor in NativeUfs.cpp'
-          nu.write_text(nu_src.replace(nu_root_old, nu_root_new, 1))
+          nu_src = nu_src.replace(nu_root_old, nu_root_new, 1)
+          nu_sync_old = 'extern "C" int native_ufs_store_sync (void)\n{\n  if (storeMode () != 2 || !gStoreRegionBlocks) return 0;\n  const uint64_t t0 = mach_absolute_time ();\n  const int ok = hostSyncCache () == kIOReturnSuccess;\n  storeAccount (&native_ufs_store_sync_ops, &native_ufs_store_sync_ticks, t0, \'s\', 0);\n  return ok;\n}'
+          nu_sync_new = nu_sync_old + '\n' + '\n'.join([
+              'extern "C" int native_ufs_query_desc (uint8_t idn, uint8_t index, void *dst, uint32_t max_bytes, uint32_t *actual_bytes)',
+              '{',
+              '  return hostQueryReadDesc (idn, index, dst, max_bytes, actual_bytes) == kIOReturnSuccess ? 0 : -1;',
+              '}',
+              'extern "C" int native_ufs_rpmb_scsi (const uint8_t *cdb, uint32_t cdb_len, int direction, void *buf, uint32_t bytes, uint32_t *scsi_status)',
+              '{',
+              '  if (direction < 0 || direction > 2) return -1;',
+              '  return hostRpmbScsi (cdb, cdb_len, static_cast<unsigned> (direction), buf, bytes, scsi_status) == kIOReturnSuccess ? 0 : -1;',
+              '}',
+          ])
+          assert nu_sync_old in nu_src, 'missing native_ufs_store_sync in NativeUfs.cpp'
+          nu.write_text(nu_src.replace(nu_sync_old, nu_sync_new, 1))
 
           rb = Path('UniXNU/drivers/RamBlock/NativeRamBlock.cpp')
           rb_src = rb.read_text()
@@ -474,7 +547,14 @@ jobs:
           assert ld_swap_old in ld_src, 'missing swapSetColorMatrix in NativeLegacyDisplay.cpp'
           ld.write_text(ld_src.replace(ld_swap_old, ld_swap_new, 1))
 
-          # Fix icon-cache daemon exit code 1 by stopping iconservicesd/agent first and handling busy top dir.
+          armdt = Path('UniXNU/drivers/ArmDTPlatform/ArmDTPlatform.cpp')
+          armdt_src = armdt.read_text()
+          armdt_old = 'const char *ArmDTPlatform::excludeList (void)\n{\n  return "()";\n}'
+          armdt_new = 'const char *ArmDTPlatform::excludeList (void)\n{\n  return "(\'options\')";\n}'
+          assert armdt_old in armdt_src, 'missing excludeList in ArmDTPlatform.cpp'
+          armdt.write_text(armdt_src.replace(armdt_old, armdt_new, 1))
+
+          # Fix icon-cache daemon exit code 1 by pruning /private/var/folders/zz (SIP/datavault) and stopping iconservices first.
           icon_rt = Path('UniXNU/scripts/build-boot-runtime.py')
           icon_src = icon_rt.read_text()
           icon_old = '\n'.join([
@@ -496,8 +576,9 @@ jobs:
               '    fi',
               '    folders="$root/private/var/folders"',
               '    if [ -d "$folders" ]; then',
-              '        /usr/bin/find -P "$folders" -mindepth 4 -maxdepth 4 \\',
-              '            \\( -path \'*/C/com.apple.iconservices\' -o -path \'*/C/com.apple.iconservices.store\' \\) \\',
+              '        /usr/bin/find -P "$folders" -maxdepth 4 \\',
+              '            -path "$folders/zz" -prune -o \\',
+              '            \\( -path "$folders/*/*/C/com.apple.iconservices" -o -path "$folders/*/*/C/com.apple.iconservices.store" \\) \\',
               '            -execdir /bin/rm -rf -- {} + 2>/dev/null || true',
               '    fi',
               '    restart_icon_services || true',
@@ -748,6 +829,8 @@ jobs:
           PYTHON
       - name: Run host tests
         run: |
+          python3 device/scripts/check-wn8030-host.py
+          python3 device/scripts/check-qcom-tee-wire-host.py
           python3 device/scripts/check-keyboard-service-host.py
           python3 device/scripts/check-keyboard-cover-host.py
           python3 device/scripts/check-lid-clamshell-host.py

@@ -19,7 +19,9 @@
 #include <libkern/c++/OSBoolean.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <libkern/crypto/sha2.h>
 #include <sys/random.h>
@@ -61,6 +63,10 @@ namespace {
 volatile int gKeyboardAttached = -1;
 IOInterruptEventSource *volatile gKeyboardInbox;
 constexpr uint32_t kRequestMs = 2000, kRefreshMs = 60000, kSlowEvery = 10, kRing = 16, kMessage = 560;
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+constexpr const char *kLogicalBatterySerial = "Sheng-DualCell-A+B";
+constexpr uint64_t kPackNominalHealthMetric = 1ULL << 10;
+#endif
 uint64_t chargeNowMs() {uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000000;}
 void chargeRandom(void *bytes, uint32_t count) {read_random(bytes, count);}
 void chargeHmac(const uint8_t *key, uint32_t keyBytes, const uint8_t *message, uint32_t bytes, uint8_t digest[32]) {
@@ -75,8 +81,22 @@ void chargeHmac(const uint8_t *key, uint32_t keyBytes, const uint8_t *message, u
 const ShengChargeCrypto kChargeCrypto = {chargeRandom, chargeHmac};
 }
 
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+// powerd 27.3 matches AppleSmartBatteryPack (ID=0) and AppleSmartBattery for macOS battery health.
+class AppleSmartBatteryPack : public IOService {
+    OSDeclareDefaultStructors(AppleSmartBatteryPack)
+};
+OSDefineMetaClassAndStructors(AppleSmartBatteryPack, IOService)
+
+class AppleSmartBattery : public IOPMPowerSource {
+    OSDeclareDefaultStructors(AppleSmartBattery)
+    using Self = AppleSmartBattery;
+    AppleSmartBatteryPack *healthPack = nullptr;
+#else
 class ShengBattery : public IOPMPowerSource {
     OSDeclareDefaultStructors(ShengBattery)
+    using Self = ShengBattery;
+#endif
     IOWorkLoop *loop = nullptr;
     IOTimerEventSource *request = nullptr, *refresh = nullptr;
     IOInterruptEventSource *inbox = nullptr;
@@ -122,7 +142,7 @@ class ShengBattery : public IOPMPowerSource {
         if (qcom_ucsi_polling && qcom_ucsi_polling()) ucsiTimer->setTimeoutMS(20);
     }
     static void ucsiTick(OSObject *owner, IOTimerEventSource *) {
-        ShengBattery *self = OSDynamicCast(ShengBattery, owner);
+        Self *self = OSDynamicCast(Self, owner);
         if (self && self->wasUp && self->ucsiPending) {
             self->ucsiPending = false;
             if (qcom_ucsi_start) self->ucsiSend(qcom_ucsi_start(self->ucsiOut));
@@ -132,14 +152,14 @@ class ShengBattery : public IOPMPowerSource {
     }
 
     static void dspState(void *context, int up) {
-        ShengBattery *self = static_cast<ShengBattery *>(context);
+        Self *self = static_cast<Self *>(context);
         if (!up) __atomic_store_n(&self->channelLost, 1u, __ATOMIC_RELEASE);
         __atomic_store_n(&self->channelUp, up ? 1u : 0u, __ATOMIC_RELEASE);
         __atomic_store_n(&self->channelChanged, 1u, __ATOMIC_RELEASE);
         self->inbox->interruptOccurred(nullptr, nullptr, 0);
     }
     static void dspReceive(void *context, const uint8_t *data, uint32_t length) {
-        ShengBattery *self = static_cast<ShengBattery *>(context);
+        Self *self = static_cast<Self *>(context);
         IOSimpleLockLock(self->ringLock);
         if (self->ringCount < kRing && length <= kMessage) {
             auto &slot = self->ring[(self->ringHead + self->ringCount) % kRing];
@@ -184,6 +204,75 @@ class ShengBattery : public IOPMPowerSource {
         if (symbol) setPSProperty(symbol, value ? kOSBooleanTrue : kOSBooleanFalse);
         OSSafeReleaseNULL(symbol);
     }
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+    void text(const char *key, const char *value) {
+        const OSSymbol *symbol = OSSymbol::withCString(key);
+        OSString *s = OSString::withCString(value);
+        if (symbol && s) setPSProperty(symbol, s);
+        OSSafeReleaseNULL(s); OSSafeReleaseNULL(symbol);
+    }
+    static bool dictNumber(OSDictionary *dict, const char *key, uint64_t value, unsigned bits) {
+        OSNumber *n = OSNumber::withNumber(value, bits);
+        const bool ok = n && dict->setObject(key, n);
+        OSSafeReleaseNULL(n);
+        return ok;
+    }
+    void updateHealthPack(const ShengBatterySnapshot &s) {
+        if (!s.present || !s.charge_known || s.design_mah <= 0 || s.design_mah > 20000 ||
+            s.full_mah < 2000 || s.full_mah > 20000 || (uint64_t)s.full_mah * 100 > (uint64_t)s.design_mah * 150 ||
+            s.raw_mah <= 0 || s.raw_mah > s.full_mah + s.full_mah / 20 || s.cycles < 0 || s.cycles >= 65535)
+            return;
+        OSDictionary *data = OSDictionary::withCapacity(11);
+        OSString *serial = OSString::withCString(kLogicalBatterySerial);
+        bool ok = data && serial;
+        if (ok) {
+            ok = data->setObject("Serial", serial);
+            ok = dictNumber(data, "RemainingCapacity", (uint64_t)(uint32_t)s.raw_mah, 32) && ok;
+            ok = dictNumber(data, "MaxCapacity", (uint64_t)(uint32_t)s.full_mah, 32) && ok;
+            ok = dictNumber(data, "AppleRawMaxCapacity", (uint64_t)(uint32_t)s.full_mah, 32) && ok;
+            ok = dictNumber(data, "DesignCapacity", (uint64_t)(uint32_t)s.design_mah, 32) && ok;
+            ok = dictNumber(data, "NominalChargeCapacity", (uint64_t)(uint32_t)s.full_mah, 32) && ok;
+            ok = dictNumber(data, "CycleCount", (uint64_t)(uint32_t)s.cycles, 32) && ok;
+            ok = dictNumber(data, "Voltage", (uint64_t)(uint32_t)(s.voltage_mv > 0 ? s.voltage_mv : 0), 32) && ok;
+            ok = dictNumber(data, "AverageCurrent", (uint64_t)(int64_t)s.current_ma, 32) && ok;
+            ok = dictNumber(data, "FullyCharged", s.fully_charged ? 1ULL : 0ULL, 32) && ok;
+            if (s.temperature_valid) ok = dictNumber(data, "Temperature", (uint64_t)(int64_t)s.temperature, 32) && ok;
+        }
+        OSSafeReleaseNULL(serial);
+        if (!ok) {
+            OSSafeReleaseNULL(data);
+            return;
+        }
+        const bool isNew = healthPack == nullptr;
+        AppleSmartBatteryPack *pack = healthPack;
+        if (!pack) {
+            pack = OSTypeAlloc(AppleSmartBatteryPack);
+            if (!pack || !pack->init() || !pack->attach(this)) {
+                OSSafeReleaseNULL(pack);
+                data->release();
+                return;
+            }
+            OSNumber *idNum = OSNumber::withNumber(0ULL, 32);
+            OSNumber *flags = OSNumber::withNumber(kPackNominalHealthMetric, 64);
+            ok = idNum && flags && pack->setProperty("ID", idNum) && pack->setProperty("FeatureFlags", flags);
+            OSSafeReleaseNULL(idNum);
+            OSSafeReleaseNULL(flags);
+        }
+        ok = ok && pack->setProperty("BatteryData", data);
+        data->release();
+        if (!ok) {
+            if (isNew) {
+                pack->detach(this);
+                pack->release();
+            }
+            return;
+        }
+        if (isNew) {
+            healthPack = pack;
+            pack->registerService();
+        }
+    }
+#endif
     void recordRaw() {
         static const int fields[8] = {BmCapacity, BmGauge1Remaining, BmGauge1Full, BmGauge2Remaining, BmGauge2Full, BmTemperature, BmCurrent, -1};
         for (unsigned i = 0; i < 7; ++i) native_battery_raw[i] = (bm.valid >> fields[i]) & 1 ? bm.value[fields[i]] : -999999;
@@ -212,7 +301,12 @@ class ShengBattery : public IOPMPowerSource {
             setExternalChargeCapable(s.external);
         }
         if (s.external_known && s.status_known) setIsCharging(s.charging);
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+        setAtWarnLevel(false);
+        setAtCriticalLevel(false);
+#else
         setAtCriticalLevel(s.critical);
+#endif
         setCurrentCapacity((unsigned)s.percent);
         setMaxCapacity(100);
         setVoltage((unsigned)(s.voltage_mv > 0 ? s.voltage_mv : 0));
@@ -226,7 +320,24 @@ class ShengBattery : public IOPMPowerSource {
         if (s.raw_mah > 0) number("AppleRawCurrentCapacity", s.raw_mah);
         if (s.full_mah > 0) {number("AppleRawMaxCapacity", s.full_mah); number("NominalChargeCapacity", s.full_mah);}
         if (s.design_mah > 0) number("DesignCapacity", s.design_mah);
-        OSDictionary *adapter = OSDictionary::withCapacity(5);
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+        text(kIOPMPSSerialKey, kLogicalBatterySerial);
+        if (s.design_mah > 0 && s.full_mah > 0) {
+            number(kIOPMPSBatteryHealthKey, ((uint64_t)s.full_mah * 100 < (uint64_t)s.design_mah * 80) ? kIOPMFairValue : kIOPMGoodValue);
+        }
+        number("AvgTimeToEmpty", s.time_to_empty_min >= 0 ? s.time_to_empty_min : 0xffff);
+        number("AvgTimeToFull", s.time_to_full_min >= 0 ? s.time_to_full_min : 0xffff);
+        {
+            clock_sec_t sec = 0; clock_usec_t usec = 0;
+            clock_get_calendar_microtime(&sec, &usec);
+            if (sec) number("UpdateTime", (int64_t)sec);
+        }
+        flag("built-in", true);
+        if (s.external_known) flag("AppleRawExternalConnected", s.external);
+        text("DeviceName", "Xiaomi Pad 6S Pro Dual-Cell");
+        text("Manufacturer", "Xiaomi");
+#endif
+        OSDictionary *adapter = OSDictionary::withCapacity(7);
         if (adapter) {
             OSNumber *family = OSNumber::withNumber(s.adapter_family, 32);
             if (family) {adapter->setObject(kIOPMPSAdapterDetailsFamilyKey, family); family->release();}
@@ -236,10 +347,20 @@ class ShengBattery : public IOPMPowerSource {
                 if (w) {adapter->setObject(kIOPMPSAdapterDetailsWattsKey, w); w->release();}
                 if (mv) {adapter->setObject(kIOPMPSAdapterDetailsVoltage, mv); mv->release();}
                 if (ma) {adapter->setObject(kIOPMPSAdapterDetailsAmperageKey, ma); ma->release();}
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+                OSNumber *idNum = OSNumber::withNumber(0ULL, 32);
+                if (idNum) {adapter->setObject(kIOPMPSAdapterDetailsIDKey, idNum); idNum->release();}
+                adapter->setObject("IsWireless", kOSBooleanFalse);
+#endif
             }
             const OSSymbol *key = OSSymbol::withCString(kIOPMPSAdapterDetailsKey);
             if (key) setPSProperty(key, adapter);
             OSSafeReleaseNULL(key);
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+            const OSSymbol *rawKey = OSSymbol::withCString("AppleRawAdapterDetails");
+            if (rawKey) setPSProperty(rawKey, adapter);
+            OSSafeReleaseNULL(rawKey);
+#endif
             adapter->release();
         }
         native_battery_stats[1] = s.percent; native_battery_stats[2] = s.voltage_mv; native_battery_stats[3] = s.current_ma;
@@ -249,6 +370,9 @@ class ShengBattery : public IOPMPowerSource {
         native_battery_stats[11] = s.full_mah; native_battery_stats[12] = s.design_mah; native_battery_stats[13] = s.cycles;
         recordRaw();
         if (!published && !s.charge_known) return;  // no charge reading yet: 0 % would read as an empty battery
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+        updateHealthPack(s);
+#endif
         if (!published) {
             // The properties are in place before anyone finds the service.
             published = true;
@@ -291,7 +415,7 @@ class ShengBattery : public IOPMPowerSource {
     }
 
     static void inboxAction(OSObject *owner, IOInterruptEventSource *, int) {
-        ShengBattery *self = OSDynamicCast(ShengBattery, owner);
+        Self *self = OSDynamicCast(Self, owner);
         if (!self || !self->channel) return;
         if (__atomic_exchange_n(&self->channelChanged, 0u, __ATOMIC_ACQ_REL)) {
             const bool up = __atomic_load_n(&self->channelUp, __ATOMIC_ACQUIRE) != 0;
@@ -371,7 +495,7 @@ class ShengBattery : public IOPMPowerSource {
         }
     }
     static void requestAction(OSObject *owner, IOTimerEventSource *) {
-        ShengBattery *self = OSDynamicCast(ShengBattery, owner);
+        Self *self = OSDynamicCast(Self, owner);
         if (!self || !self->wasUp) return;
         if (self->auth.pending) {
             sheng_charge_auth_timeout(&self->auth, chargeNowMs()); self->handle(BmAnswer); return;
@@ -381,14 +505,14 @@ class ShengBattery : public IOPMPowerSource {
         self->handle(self->bm.cycles_done != before ? BmCycleDone : BmAnswer);
     }
     static void refreshAction(OSObject *owner, IOTimerEventSource *sender) {
-        ShengBattery *self = OSDynamicCast(ShengBattery, owner);
+        Self *self = OSDynamicCast(Self, owner);
         if (!self || !self->wasUp) return;
         sheng_battmgr_refresh(&self->bm, ++self->refreshes % kSlowEvery == 0);
         self->handle(BmAnswer);
         sender->setTimeoutMS(kRefreshMs);
     }
     static void authAction(OSObject *owner, IOTimerEventSource *) {
-        ShengBattery *self = OSDynamicCast(ShengBattery, owner);
+        Self *self = OSDynamicCast(Self, owner);
         if (self && self->wasUp) self->handle(BmAnswer);
     }
 
@@ -406,17 +530,17 @@ public:
         if (PE_parse_boot_argn("ucsi-delay", &delay, sizeof delay)) ucsiDelayMs = delay > 600 ? 600000u : delay * 1000u;
         loop = IOWorkLoop::workLoop();
         ringLock = IOSimpleLockAlloc();
-        inbox = IOInterruptEventSource::interruptEventSource(this, &ShengBattery::inboxAction);
-        request = IOTimerEventSource::timerEventSource(this, &ShengBattery::requestAction);
-        refresh = IOTimerEventSource::timerEventSource(this, &ShengBattery::refreshAction);
-        ucsiTimer = IOTimerEventSource::timerEventSource(this, &ShengBattery::ucsiTick);
-        authTimer = IOTimerEventSource::timerEventSource(this, &ShengBattery::authAction);
+        inbox = IOInterruptEventSource::interruptEventSource(this, &Self::inboxAction);
+        request = IOTimerEventSource::timerEventSource(this, &Self::requestAction);
+        refresh = IOTimerEventSource::timerEventSource(this, &Self::refreshAction);
+        ucsiTimer = IOTimerEventSource::timerEventSource(this, &Self::ucsiTick);
+        authTimer = IOTimerEventSource::timerEventSource(this, &Self::authAction);
         if (!loop || !ringLock || !inbox || !request || !refresh || !ucsiTimer || !authTimer || loop->addEventSource(inbox) != kIOReturnSuccess ||
             loop->addEventSource(request) != kIOReturnSuccess || loop->addEventSource(refresh) != kIOReturnSuccess ||
             loop->addEventSource(ucsiTimer) != kIOReturnSuccess || loop->addEventSource(authTimer) != kIOReturnSuccess)
             return false;
         native_battery_stats[0] = 1;
-        const ShengAdspClient client = {&ShengBattery::dspState, &ShengBattery::dspReceive};
+        const ShengAdspClient client = {&Self::dspState, &Self::dspReceive};
         channel = sheng_adsp_channel ? sheng_adsp_channel("PMIC_RTR_ADSP_APPS", 1024, 4, 0, &client, this) : nullptr;
         if (!channel) return false;
         native_battery_stats[0] = 2;
@@ -425,11 +549,19 @@ public:
         return true;
     }
 };
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+OSDefineMetaClassAndStructors(AppleSmartBattery, IOPMPowerSource)
+#else
 OSDefineMetaClassAndStructors(ShengBattery, IOPMPowerSource)
+#endif
 
 // Called by BatteryProbe.cpp once this file's classes are registered.
 extern "C" void sheng_battery_start(void) {
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+    AppleSmartBattery *battery = OSTypeAlloc(AppleSmartBattery);
+#else
     ShengBattery *battery = OSTypeAlloc(ShengBattery);
+#endif
     if (!battery || !battery->init() || !battery->attach(IOService::getPlatform())) {
         if (battery) battery->release();
         native_battery_stats[0] = -1;

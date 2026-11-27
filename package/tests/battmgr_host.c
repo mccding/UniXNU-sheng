@@ -148,18 +148,18 @@ int main(void)
     /* With the fuel gauges answering, the charge is their remaining over full: (1000 + 1000) / (5000 + 4800) = 20 %, whatever the
      * capacity property says; a gauge that stops answering falls back to the property. */
     board_answers = 1;
-    board[0x8a] = 1000; board[0x8b] = 5000; board[0xa6] = 1000; board[0xa7] = 4800;
+    board[0x8a] = 1000000; board[0x8b] = 5000000; board[0xa6] = 1000000; board[0xa7] = 4800000;
     battery[4] = 100;
     sheng_battmgr_refresh(&b, 0);
     run_cycle(&b);
     sheng_battmgr_snapshot(&b, &s);
     CHECK(s.percent == 20 && s.charge_known && !s.critical && s.raw_mah == 2000);
-    board[0xa6] = 4800;  /* rounds: 5800 * 100 / 9800 = 59.18 */
+    board[0xa6] = 4800000;  /* rounds: 5800 * 100 / 9800 = 59.18 */
     sheng_battmgr_refresh(&b, 0);
     run_cycle(&b);
     sheng_battmgr_snapshot(&b, &s);
     CHECK(s.percent == 59 && s.raw_mah == 5800);
-    board[0x8a] = 5000; board[0xa6] = 4900;  /* more than full reads 100 */
+    board[0x8a] = 5000000; board[0xa6] = 4900000;  /* more than full reads 100 */
     sheng_battmgr_refresh(&b, 0);
     run_cycle(&b);
     sheng_battmgr_snapshot(&b, &s);
