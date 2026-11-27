@@ -25,16 +25,20 @@ static const char kAesOkLog[] AES_PROBE_CONST = "SoftwareAES: IOAESAccelerator r
 static const char kDiagPostFailLog[] AES_PROBE_CONST = "DiagnosticDataStandIn: postModLoad failed\n";
 static const char kDiagSkipLog[] AES_PROBE_CONST = "DiagnosticDataStandIn: start skipped\n";
 
+static volatile uint32_t gDiagRegistered = 0;
+void registerDiagnosticStandIn(IOService *parent);
+
 void fail(int step)
 {
     sheng_software_aes_state = -step;
     IOLog(kAesFailLog, -step);
+    registerDiagnosticStandIn(IOService::getResourceService());
     thread_terminate(current_thread());
 }
 
 void registerDiagnosticStandIn(IOService *parent)
 {
-    if (!parent) return;
+    if (!parent || __atomic_exchange_n(&gDiagRegistered, 1u, __ATOMIC_ACQ_REL) != 0) return;
     void *diagHandle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
     if (!diagHandle) return;
     diagnostic_data_static_init();

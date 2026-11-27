@@ -1,0 +1,38 @@
+turnip: darwin, sync active client GPU VA window across probe/device slot transitions (0006)
+
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 4f0f085..2af57f3 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -591,7 +591,9 @@ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
+    if (!va->seeded) {
+       /* The first device of the process: the whole range is free. */
+       va->seeded = true;
+-      darwin_va_add(va, dev->physical_device->va_start, dev->physical_device->va_size);
++      const uint64_t va_start = (dw.open && dw.info.va_size) ? dw.info.va_start : dev->physical_device->va_start;
++      const uint64_t va_size = (dw.open && dw.info.va_size) ? dw.info.va_size : dev->physical_device->va_size;
++      darwin_va_add(va, va_start, va_size);
+    }
+    if (flags & TU_BO_ALLOC_REPLAYABLE) {
+       if (client_iova) {
+@@ -2289,6 +2291,20 @@ darwin_device_init(struct tu_device *dev)
+       if (result != VK_SUCCESS)
+          return result;
+    }
++   /* Sync the active kernel connection's GPU VA window onto the physical device in case it changed
++    * after the enumeration probe reopened into another client slot (Pad 8 Pro 0006). */
++   if (dw.info.va_size &&
++       (dev->physical_device->va_start != dw.info.va_start ||
++        dev->physical_device->va_size != dw.info.va_size)) {
++      os_log_error(OS_LOG_DEFAULT,
++                   "NativeAdreno: device window moved %#llx+%#llx -> %#llx+%#llx",
++                   (unsigned long long)dev->physical_device->va_start,
++                   (unsigned long long)dev->physical_device->va_size,
++                   (unsigned long long)dw.info.va_start,
++                   (unsigned long long)dw.info.va_size);
++      dev->physical_device->va_start = dw.info.va_start;
++      dev->physical_device->va_size = dw.info.va_size;
++   }
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)
+       vk_zalloc(&dev->vk.alloc, sizeof(*retire), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+    if (!retire) {

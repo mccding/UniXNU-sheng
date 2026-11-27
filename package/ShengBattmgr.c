@@ -22,7 +22,7 @@ static const struct {uint8_t opcode, property, slow;} kFields[BmFields] = {
     [BmUsbCurrent] = {SHENG_BATTMGR_OP_USB_GET, 3, 0},
     [BmTimeToEmpty] = {SHENG_BATTMGR_OP_BATTERY_GET, 21, 0},
     [BmTimeToFull] = {SHENG_BATTMGR_OP_BATTERY_GET, 20, 0},
-    /* the fuel gauges: remaining and full charge of each (uAh) */
+    /* the fuel gauges: remaining and full charge of each (mAh) */
     [BmGauge1Remaining] = {SHENG_BATTMGR_OP_BOARD_GET, 0x8a, 0},
     [BmGauge1Full] = {SHENG_BATTMGR_OP_BOARD_GET, 0x8b, 0},
     [BmGauge2Remaining] = {SHENG_BATTMGR_OP_BOARD_GET, 0xa6, 0},

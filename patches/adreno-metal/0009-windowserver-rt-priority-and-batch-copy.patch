@@ -1,7 +1,7 @@
 From: UniXNU <unixnu@users.noreply.github.com>
 Subject: [PATCH] perf(metal): adopt WindowServer RT priority in didSchedule/finish and zero-malloc EncodeBatch::copyBytes (AdrenoMetal#66)
 
-Ports the Turnip-independent parts of UniXNU/AdrenoMetal#66 on top of 0001..0008:
+Ports the Turnip-independent parts of UniXNU/AdrenoMetal#66 on top of 0001..0007:
 1. Detect WindowServer render threads by fixed-priority Mach policy or display/RenderServer names
    and propagate Mach THREAD_EXTENDED_POLICY / THREAD_PRECEDENCE_POLICY (or SCHED_RR 79 fallback)
    to didSchedule and finish completion threads so WindowServer handlers never decay to PRI 31T.
@@ -9,7 +9,7 @@ Ports the Turnip-independent parts of UniXNU/AdrenoMetal#66 on top of 0001..0008
    never mixing raw payload bytes into closure chunks walked by EncodeBatch::run().
 ---
 diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
-index 6674314..6afc5d1 100644
+index 46b2142..f413a97 100644
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
 @@ -37,6 +37,7 @@
@@ -20,7 +20,7 @@ index 6674314..6afc5d1 100644
  #include <thread>
  #include <fcntl.h>
  #include <unistd.h>
-@@ -2692,8 +2693,8 @@ class EncodeBatch {
+@@ -2406,8 +2407,8 @@ class EncodeBatch {
   struct Header {void (*run)(void *closure);size_t size;};
   static constexpr size_t kAlign=16,kChunk=16384;
   static constexpr size_t rounded(size_t n) {return (n+kAlign-1)&~(kAlign-1);}
@@ -31,7 +31,7 @@ index 6674314..6afc5d1 100644
  public:
   uint64_t serial=0,enqueuedUs=0;
   size_t count=0;
-@@ -2712,6 +2713,19 @@ public:
+@@ -2426,6 +2427,19 @@ public:
    new(slot) Header{[](void *closure){Closure &call=*static_cast<Closure *>(closure);call();call.~Closure();},need};
    new(slot+rounded(sizeof(Header))) Closure(std::forward<F>(work));
   }
@@ -51,7 +51,7 @@ index 6674314..6afc5d1 100644
   // Each call in the order added, each destroyed once it ran; the batch is empty after.
   void run() {
    for(Chunk &chunk:chunks) {
-@@ -2722,7 +2736,8 @@ public:
+@@ -2436,7 +2450,8 @@ public:
     }
     chunk.used=0;
    }
@@ -61,7 +61,7 @@ index 6674314..6afc5d1 100644
   }
  };
  struct EncodeThread {
-@@ -2746,15 +2761,41 @@ static bool encodeWindowServerPriorityWanted() {
+@@ -2460,15 +2475,41 @@ static bool encodeWindowServerPriorityWanted() {
  // samples during encoding calls of 30 ms or more were on a run queue. The first CoreAnimation thread that makes a command buffer is the
  // reference; a timeshare reference leaves the encoding thread as it is.
  static std::atomic<pthread_t> gEncodeReference{nullptr};
@@ -111,7 +111,7 @@ index 6674314..6afc5d1 100644
  }
  static EncodeThread &encodeThread() {
   static EncodeThread *thread=[]{
-@@ -2776,7 +2817,7 @@ static EncodeThread &encodeThread() {
+@@ -2490,7 +2531,7 @@ static EncodeThread &encodeThread() {
      EncodeBatch *batch=t.batches.front();t.batches.pop_front();
      const uint32_t depth=(uint32_t)t.batches.size(),tasks=(uint32_t)batch->count;
      lock.unlock();tEncodeBatchId=batch->serial;
@@ -120,7 +120,7 @@ index 6674314..6afc5d1 100644
      batchStage(batch->serial,2,batch->enqueuedUs,tasks,depth);
      const uint64_t cpuBefore=diagOn()?threadCpuUs():0;
      @autoreleasepool {batch->run();}
-@@ -2791,6 +2832,14 @@ static EncodeThread &encodeThread() {
+@@ -2505,6 +2546,14 @@ static EncodeThread &encodeThread() {
   return *thread;
  }
  static bool onEncodeQueue() {return tOnEncodeThread;}
@@ -135,7 +135,7 @@ index 6674314..6afc5d1 100644
  static void encodeFlush() {
   if(!tBatch || !tBatch->count)return;
   EncodeThread &t=encodeThread();
-@@ -3111,9 +3160,9 @@ static uint64_t encodeCommandOf(id object) {
+@@ -2825,9 +2874,9 @@ static uint64_t encodeCommandOf(id object) {
  - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
   if(dumpMaybe(_commandBuffer))[self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
   if(gDrawStats)[self noteState:kDSBytes key:stage<<8|(uint32_t)index object:nullptr value:hashBytes(bytes,length)];
@@ -148,7 +148,7 @@ index 6674314..6afc5d1 100644
  }
  - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
   if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
-@@ -3560,9 +3609,18 @@ static void scheduled(void *context);
+@@ -3274,9 +3323,18 @@ static void scheduled(void *context);
  // instead; the swap offered by them is held back by the scanout client until the GPU finished everything committed before the offer
  // (NBWaitInFlight), and waitUntilCompleted, the resource waits and the real completion work (surface flushes, release) are unchanged.
  static bool earlyOn() {return false;}   // reverted: with the handlers early the blur passes read frames that were not finished (i343, i344)
@@ -169,7 +169,7 @@ index 6674314..6afc5d1 100644
  }
  extern "C" void NBWaitInFlight(uint64_t beforeUs);
  // ---- NATIVE_METAL_DUMP_CB ----
-@@ -4070,6 +4128,7 @@ static char kUserDictionaryKey;
+@@ -3784,6 +3842,7 @@ static char kUserDictionaryKey;
  - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
  // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
  - (void)didSchedule {
@@ -177,7 +177,7 @@ index 6674314..6afc5d1 100644
   {
    const uint64_t took=nowUs()-self.committedUs;
    std::lock_guard<std::mutex> lock(gCommitLock);
-@@ -4091,6 +4150,7 @@ static char kUserDictionaryKey;
+@@ -3805,6 +3864,7 @@ static char kUserDictionaryKey;
  // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
  - (void)finish {
   DetailCommandScope commandScope(traceNumber);

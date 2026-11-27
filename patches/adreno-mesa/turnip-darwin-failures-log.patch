@@ -1,0 +1,99 @@
+turnip: darwin, log kernel and allocation failures via os_log_error (0003)
+
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 2af57f3..4782ddb 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -188,6 +188,21 @@ tu_darwin_bo_cache_stats(uint64_t out[8])
+ static NativeAdrenoAbiPriority dw_priority;
+ static bool dw_priority_known;
+ 
++static void
++darwin_log_failure(const char *op, kern_return_t kr, uint64_t a, uint64_t b)
++{
++   static uint64_t count = 0;
++   const uint64_t n = __atomic_fetch_add(&count, 1, __ATOMIC_RELAXED) + 1;
++   if (n <= 16 || (n & (n - 1)) == 0) {
++      const char *proc = getprogname();
++      os_log_error(OS_LOG_DEFAULT,
++                   "NativeAdreno: %{public}s %{public}s failed: 0x%x (0x%llx, 0x%llx) [#%llu]",
++                   proc ? proc : "?", op, (unsigned)kr,
++                   (unsigned long long)a, (unsigned long long)b,
++                   (unsigned long long)n);
++   }
++}
++
+ static kern_return_t
+ dw_call(uint32_t method, const void *in, size_t in_size, void *out,
+         size_t out_size)
+@@ -1131,8 +1146,10 @@ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+    if (cleanup == KERN_SUCCESS) {
+       if (own_iova)   /* a lazy BO's range is its sparse VMA's, which frees it */
+          darwin_free_iova(dev, iova, size);
++      darwin_log_failure("BoMap", map_error, iova, size);
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoMap failed: 0x%x", map_error);
+    }
++   darwin_log_failure("BoMapCleanup", cleanup, iova, size);
+    /* A failed map may have modified tables. Unknown cleanup never authorizes
+     * reusing its IOVA, even though no tu_bo could be published to the caller. */
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+@@ -1273,6 +1290,7 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+             continue;
+          }
+          darwin_retry_done(retire, retries, false);
++         darwin_log_failure("BoAlloc", kr, alloc_size, retries);
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+       }
+       darwin_retry_done(retire, retries, true);
+@@ -1354,6 +1372,7 @@ darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer,
+    kern_return_t kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
+    if (kr != KERN_SUCCESS) {
+       darwin_free_iova(dev, iova, size);
++      darwin_log_failure("BoImport", kr, (uint64_t)(uintptr_t)pointer, size);
+       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
+    }
+    NativeAdrenoAbiBoMap map = {.handle = reply.handle, .iova = iova, .permissions = 3u, .writeback = 0, .shareability = 2};
+@@ -1412,8 +1431,10 @@ darwin_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+       }
+    }
+    kern_return_t kr = dw_call(NativeAdrenoMethodBoCpuMap, &req, sizeof(req), &reply, sizeof(reply));
+-   if (kr != KERN_SUCCESS)
++   if (kr != KERN_SUCCESS) {
++      darwin_log_failure("BoCpuMap", kr, bo->darwin_handle, bo->size);
+       return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED, "BoCpuMap failed: 0x%x", kr);
++   }
+ 
+    mach_vm_address_t address = (mach_vm_address_t)(uintptr_t)placed_addr;
+    mach_vm_size_t length = 0;
+@@ -1428,6 +1449,7 @@ darwin_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+    if (kr != KERN_SUCCESS || !address || length < bo->size) {
+       NativeAdrenoAbiBoCpuUnmap undo = {.handle = bo->darwin_handle, .token = reply.token};
+       dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
++      darwin_log_failure("IOConnectMapMemory64", kr, bo->size, options);
+       return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED, "IOConnectMapMemory64 failed: 0x%x", kr);
+    }
+ 
+@@ -2164,8 +2186,10 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+          *fence = (uint32_t)reply.fence;
+          return VK_SUCCESS;
+       }
+-      if (kr != kIOReturnBusy)
++      if (kr != kIOReturnBusy) {
++         darwin_log_failure("Submit", kr, 0, 0);
+          return vk_device_set_lost(&dev->vk, "submit failed: 0x%x", kr);
++      }
+       rec->busy++;
+ 
+       pthread_mutex_lock(&dw.lock);
+@@ -2440,8 +2464,10 @@ darwin_device_check_status(struct tu_device *device)
+    kern_return_t kr = dw_call(NativeAdrenoMethodGetStatus, NULL, 0, &reply, sizeof(reply));
+    if (kr == kIOReturnUnsupported)
+       return VK_SUCCESS; /* counters not attached in this kernel */
+-   if (kr != KERN_SUCCESS)
++   if (kr != KERN_SUCCESS) {
++      darwin_log_failure("GetStatus", kr, 0, 0);
+       return vk_device_set_lost(&device->vk, "error getting GPU status: 0x%x", kr);
++   }
+    if (reply.faults != device->fault_count) {
+       /* The kernel ended a submission of this device (a hang or a fault): it retired that submission, restarted the GPU and
+        * replayed every other one. The device's memory, pipelines and queues are as they were, so the device is not lost: a

@@ -904,8 +904,11 @@ sources += [KITS / 'VideoProbe.cpp', KITS / 'VideoToolboxProbe.cpp', ROOT / 'scr
 sources += [Path(name) for name in json.loads((IRIS_OUT / 'c/report.json').read_text())['source']]
 for directory in ('include', 'kernel', 'src', 'shim'):
     sources += sorted((IRIS / directory).rglob('*.h')) + sorted((IRIS / directory).glob('*.cpp'))
-sources += [KITS / name for name in ('SmmuBypass.h', 'AppsSmmuLock.h', 'UsbProbe.cpp')]
+sources += [KITS / name for name in ('SmmuBypass.h', 'AppsSmmuLock.h', 'UsbProbe.cpp', 'AppleARMBacklight.cpp', 'ShengBattery.cpp', 'ShengBattmgr.c')]
 sources += [KITS / name for name in ('KeyboardCover.cpp', 'KeyboardProbe.cpp', 'KeyboardService.h', 'KeyboardTrace.h', 'QcomDevAuth.cpp', 'QcomTeeWire.h', 'PianoWn8030.h', 'TouchLid.h', 'LidClamshell.h', 'ShengSleep.cpp', 'ShengSleep.h', 'Wn8030.c', 'Wn8030.h', 'GeniI2c.c', 'GeniI2c.h', 'AppleARMBacklight.cpp', 'BacklightProbe.cpp', 'PianoAndroidBrightness.h', 'ShengBacklightCurve.h', 'PianoDiskIdentity.h', 'DiagnosticDataStandIn.cpp', 'SoftwareAesProbe.cpp')]
+if MACOS:
+    sources += [ROOT / 'drivers/SoftwareAES/NativeAES.cpp', ROOT / 'drivers/SoftwareAES/OriginalAESABI.h',
+                KITS / 'SoftwareAesProbe.cpp', Path(__file__).resolve().with_name(f'software-aes-{BUILD}.json')]
 sources += [keyboard_firmware]
 sources += [USB / 'QcomDwc3.cpp', USB / 'QcomEusb2Phy.h', USB / 'QcomQmpUsb3.h', USB / 'QcomUcsi.h', ROOT / f'scripts/usb-xdci-{BUILD}.json', ROOT / f'scripts/usb-xhci-{BUILD}.json']
 

@@ -211,6 +211,14 @@ static Float32 toDb(Float32 scalar) {const Float32 r = 1.0f - (scalar < 0 ? 0 : 
 static Float32 toScalar(Float32 db) {return db <= kMinDb ? 0.0f : db >= 0 ? 1.0f : 1.0f - sqrtf(db / kMinDb);}
 static Float32 gain(void) {return gVolume <= 0.0f ? 0.0f : powf(10.0f, toDb(gVolume) / 20.0f);}
 
+static _Atomic int gVolNotifyPending = 0;
+static dispatch_queue_t volumeNotifyQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("org.unixnu.sheng.audio-vol", DISPATCH_QUEUE_SERIAL); });
+    return q;
+}
+
 static OSStatus setProperty(AudioObjectID o, const AudioObjectPropertyAddress *a, UInt32 size, const void *data) {
     if (o == kVolume && size >= sizeof(Float32)) {
         Float32 v = *(const Float32 *)data;
@@ -222,9 +230,16 @@ static OSStatus setProperty(AudioObjectID o, const AudioObjectPropertyAddress *a
             diag->volume_milli = (UInt32)(gVolume * 1000.0f);
             diag->volume_sets += 1;
         }
-        AudioObjectPropertyAddress changed[2] = {{kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
-                                                 {kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain}};
-        gHost->PropertiesChanged(gHost, kVolume, 2, changed);
+        if (gHost && !atomic_exchange(&gVolNotifyPending, 1)) {
+            dispatch_async(volumeNotifyQueue(), ^{
+                atomic_store(&gVolNotifyPending, 0);
+                AudioObjectPropertyAddress changed[2] = {
+                    {kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+                    {kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain}
+                };
+                if (gHost) gHost->PropertiesChanged(gHost, kVolume, 2, changed);
+            });
+        }
         return 0;
     }
     if ((o == kOutStream || o == kInStream) && (a->mSelector == kAudioStreamPropertyVirtualFormat || a->mSelector == kAudioStreamPropertyPhysicalFormat)) {
