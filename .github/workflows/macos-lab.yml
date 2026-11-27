@@ -116,6 +116,10 @@ jobs:
           mm_src = mm.read_text()
           mm_subs = [
               (
+                  'Memory = FdtPathOffset (Fdt, "/memory");',
+                  'Memory = FdtPathOffset (Fdt, "/memory");\n  if (Memory < 0 && Root >= 0) {\n    for (INT32 Node = FdtFirstSubnode (Fdt, Root); Node >= 0; Node = FdtNextSubnode (Fdt, Node)) {\n      CONST CHAR8 *Type = FdtGetProp (Fdt, Node, "device_type", &Length);\n      if (Type != NULL && Length == 7 && CompareMem (Type, "memory", 7) == 0) { Memory = Node; break; }\n    }\n  }',
+              ),
+              (
                   'Fdt32ToCpu (ReadUnaligned32 (Value)) != 8',
                   '(Fdt32ToCpu (ReadUnaligned32 (Value)) != 8 && Fdt32ToCpu (ReadUnaligned32 (Value)) != 12 && Fdt32ToCpu (ReadUnaligned32 (Value)) != 16)',
               ),
@@ -125,7 +129,7 @@ jobs:
               ),
               (
                   'if (Base == 0x8c0000000ULL && End == 0xa00000000ULL) { HasHighBank = TRUE; }',
-                  'if (Base == 0x8c0000000ULL && End >= 0xa00000000ULL && End <= 0xc00000000ULL) { HasHighBank = TRUE; }',
+                  'if (Base == 0x8c0000000ULL && End >= 0x900000000ULL && End <= 0xc00000000ULL) { HasHighBank = TRUE; }',
               ),
               (
                   '(Inputs[I].Base >= 0x880000000ULL && Inputs[I].End <= 0xa00000000ULL)',
