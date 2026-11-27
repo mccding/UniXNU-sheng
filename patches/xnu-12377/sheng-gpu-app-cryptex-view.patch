@@ -1,0 +1,316 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index eaf5516..a67c2c7 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8618,7 +8618,60 @@ native_gpu_bundle_protect(const char *path)
+ 	int error = native_gpu_bundle_protect_one(part);
+ 	return first ? first : error;
+ }
++#ifdef XNU_OWNER_APP_VOLUME_UUID
++extern volatile int native_owner_app_cryptex_stage;
++#endif
++static int
++native_gpu_bundle_unprotect_one(const char *path)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error == ENOENT) {
++		return 0;
++	}
++	if (error) {
++		return error;
++	}
++	struct vnode_attr va;
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_flags);
++	error = vnode_getattr(vp, &va, ctx);
++	if (!error && (va.va_flags & SF_RESTRICTED)) {
++		uint32_t flags = va.va_flags & ~SF_RESTRICTED;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_flags, flags);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	int xerr = vn_removexattr(vp, "com.apple.rootless", XATTR_NOSECURITY, ctx);
++	if (xerr && xerr != ENOATTR && xerr != ENOTSUP && !error) {
++		error = xerr;
++	}
++	vnode_put(vp);
++	return error;
++}
++static bool
++native_gpu_app_view_wanted(void)
++{
++#ifdef XNU_OWNER_APP_VOLUME_UUID
++	uint32_t enabled = 0;
++	return PE_parse_boot_argn("gpu-app-view", &enabled, sizeof(enabled)) && enabled == 1 && native_owner_app_cryptex_stage == 5;
++#else
++	return false;
++#endif
++}
+ #endif /* XNU_TARGET_OS_OSX */
++static int native_gpu_addon_parents(proc_t p, user_addr_t scratch, const char *path);
++static int
++native_gpu_addon_write_dir(proc_t p, user_addr_t scratch, const char *path, const uint8_t *data, uint64_t size, uint32_t mode,
++    vfs_context_t ctx)
++{
++	int error = native_gpu_addon_write(path, data, size, mode, ctx);
++	if (error == ENOENT && !(error = native_gpu_addon_parents(p, scratch, path))) {
++		error = native_gpu_addon_write(path, data, size, mode, ctx);
++	}
++	return error;
++}
+ static void
+ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ {
+@@ -8674,6 +8727,9 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 	}
+ 	native_gpu_addon_files = (int)count;
+ 	vfs_context_t ctx = vfs_context_current();
++#if XNU_TARGET_OS_OSX
++	const bool app_view = native_gpu_app_view_wanted();
++#endif
+ 	char path[192];
+ 	at = 24;
+ 	for (uint32_t i = 0; i < count; ++i) {
+@@ -8690,12 +8746,21 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		/* macOS: GPUBundles/ files go to the Data volume's /Library/GPUBundles, where IOGPU looks for <MetalPluginName>.bundle,
+ 		 * protected as kmutil installs them (native_gpu_bundle_protect); Library/ files to the same volume's /Library (the audio
+ 		 * server's driver directory Audio/Plug-Ins/HAL). Both are written with the kernel's context, so a protected file can be
+-		 * replaced on a later boot. */
++		 * replaced on a later boot. With gpu-app-view=1, the two bundle Mach-Os live under /private/var/ngpu/app-library/Frameworks
++		 * (shown union-mounted inside the App cryptex) and /Library/GPUBundles/.../Contents/MacOS holds symlinks to them. */
+ 		const bool bundle_file = !strncmp(name, "GPUBundles/", sizeof("GPUBundles/") - 1);
++		const char *app_subpath = bundle_file ? name + sizeof("GPUBundles/") - 1 : NULL;
++		const bool is_bundle_macho = bundle_file &&
++		    (!strcmp(name, "GPUBundles/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal") ||
++		     !strcmp(name, "GPUBundles/NativeAdrenoMetal.bundle/Contents/MacOS/libvulkan_freedreno.dylib"));
+ 		const bool library_file = bundle_file || !strncmp(name, "Library/", sizeof("Library/") - 1) ||
+ 		    !strncmp(name, "Applications/", sizeof("Applications/") - 1);
+-		snprintf(path, sizeof(path), bundle_file ? "/Library/%s" : library_file ? "/%s" : "/private/var/ngpu/%s", name);
+-		vfs_context_t file_ctx = library_file ? vfs_context_kernel() : ctx;
++		if (app_view && is_bundle_macho) {
++			snprintf(path, sizeof(path), "/private/var/ngpu/app-library/Frameworks/%s", app_subpath);
++		} else {
++			snprintf(path, sizeof(path), bundle_file ? "/Library/%s" : library_file ? "/%s" : "/private/var/ngpu/%s", name);
++		}
++		vfs_context_t file_ctx = (library_file && !(app_view && is_bundle_macho)) ? vfs_context_kernel() : ctx;
+ #else
+ 		snprintf(path, sizeof(path), "/private/var/ngpu/%s", name);
+ 		vfs_context_t file_ctx = ctx;
+@@ -8703,18 +8768,38 @@ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ 		uint8_t *data = kalloc_data(size ? size : 1, Z_WAITOK);
+ 		int error = data ? native_gpu_addon_inflate(addon + at, packed, data, size) : ENOMEM;
+ 		if (!error) {
+-			error = native_gpu_addon_write(path, data, size, mode, file_ctx);
+-			if (error == ENOENT && !(error = native_gpu_addon_parents(p, scratch, path))) {
+-				error = native_gpu_addon_write(path, data, size, mode, file_ctx);
++			error = native_gpu_addon_write_dir(p, scratch, path, data, size, mode, file_ctx);
++#if XNU_TARGET_OS_OSX
++			if (!app_view && bundle_file && error == ELOOP) {
++				(void)native_gpu_bundle_unprotect_one("/Library/GPUBundles/NativeAdrenoMetal.bundle/Contents/MacOS");
++				(void)native_gpu_bundle_unprotect_one(path);
++				struct unlink_args uargs = {.path = scratch + 0xc00};
++				int32_t ures = 0;
++				if (!copyout(path, uargs.path, strlen(path) + 1)) {
++					int uerr = unlink(p, &uargs, &ures);
++					if (!uerr || uerr == ENOENT) {
++						error = native_gpu_addon_write_dir(p, scratch, path, data, size, mode, file_ctx);
++					}
++				}
+ 			}
++#endif
+ 		}
+ #if XNU_TARGET_OS_OSX
+-		if (bundle_file && error <= 0) {
++		if (bundle_file && !(app_view && is_bundle_macho) && error <= 0) {
+ 			int protect_error = native_gpu_bundle_protect(path);
+ 			if (protect_error) {
+ 				native_gpu_bundle_protect_error = protect_error;
+ 			}
+ 		}
++		if (app_view && bundle_file && !is_bundle_macho &&
++		    !strncmp(app_subpath, "NativeAdrenoMetal", sizeof("NativeAdrenoMetal") - 1) && error <= 0) {
++			char app_path[192];
++			snprintf(app_path, sizeof(app_path), "/private/var/ngpu/app-library/Frameworks/%s", app_subpath);
++			int mirror_error = native_gpu_addon_write_dir(p, scratch, app_path, data, size, mode, ctx);
++			if (mirror_error > 0) {
++				error = mirror_error;
++			}
++		}
+ #endif
+ 		if (data) {
+ 			kfree_data(data, size ? size : 1);
+@@ -9761,6 +9846,162 @@ native_owner_macos_gpu_shader_cache(proc_t p, user_addr_t scratch, bool covered)
+ 	printf("owner Data: GPU shader cache %s shown at %s: step %d, %d\n", cache, point, step, error);
+ }
+ 
++/*
++ * gpu-app-view=1: union-mount /private/var/ngpu/app-library over /System/Volumes/Preboot/Cryptexes/App/System/Library and
++ * symlink only the two Mach-Os in /Library/GPUBundles/NativeAdrenoMetal.bundle/Contents/MacOS/ to the Frameworks directory inside
++ * that App cryptex view (matching the WebKit GPU/WebContent and replayd sandbox allow-list while keeping SIP enabled and the bundle
++ * metadata trusted under /Library/GPUBundles).
++ */
++volatile int native_gpu_app_view_stage = 0;
++volatile int native_gpu_app_view_status = -1;
++volatile int native_gpu_app_view_links = 0;
++volatile int native_gpu_app_view_link_error = 0;
++static void
++native_owner_macos_gpu_app_cryptex_view(proc_t p, user_addr_t scratch)
++{
++	if (!native_gpu_app_view_wanted()) {
++		return;
++	}
++	static const char app_source[] = "/private/var/ngpu/app-library";
++	static const char app_point[] = "/System/Volumes/Preboot/Cryptexes/App/System/Library";
++	static const char *const stage1_files[] = {
++		"/private/var/ngpu/app-library/Frameworks/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal",
++		"/private/var/ngpu/app-library/Frameworks/NativeAdrenoMetal.bundle/Contents/MacOS/libvulkan_freedreno.dylib",
++		"/private/var/ngpu/app-library/Frameworks/NativeAdrenoMetal.publish",
++	};
++	static const char *const stage4_checks[] = {
++		"/Applications/Safari.app/Contents/Info.plist",
++		"/System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal",
++		"/System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/NativeAdrenoMetal.bundle/Contents/MacOS/libvulkan_freedreno.dylib",
++		"/System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/NativeAdrenoMetal.publish",
++	};
++	static const char *const machos[] = {"NativeAdrenoMetal", "libvulkan_freedreno.dylib"};
++	vfs_context_t ctx = vfs_context_current();
++	vfs_context_t kctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int error = 0;
++	native_gpu_app_view_links = 0;
++	native_gpu_app_view_link_error = 0;
++
++	for (size_t i = 0; i < sizeof(stage1_files) / sizeof(stage1_files[0]); ++i) {
++		error = vnode_lookup(stage1_files[i], VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++		if (!error) {
++			if (vnode_vtype(vp) != VREG) {
++				error = ENOTDIR;
++			}
++			vnode_put(vp);
++		}
++		if (error) {
++			goto out;
++		}
++	}
++	native_gpu_app_view_stage = 1;
++
++	error = vnode_lookup(app_point, 0, &vp, ctx);
++	if (!error) {
++		if (vnode_vtype(vp) != VDIR) {
++			error = ENOTDIR;
++		}
++		vnode_put(vp);
++	}
++	if (error) {
++		goto out;
++	}
++	native_gpu_app_view_stage = 2;
++
++	error = native_cryptex_os_bind(p, scratch, app_source, app_point, MNT_UNION);
++	if (error) {
++		goto out;
++	}
++	native_gpu_app_view_stage = 3;
++
++	for (size_t i = 0; i < sizeof(stage4_checks) / sizeof(stage4_checks[0]); ++i) {
++		error = vnode_lookup(stage4_checks[i], 0, &vp, ctx);
++		if (error) {
++			goto out;
++		}
++		vnode_put(vp);
++	}
++	native_gpu_app_view_stage = 5;
++
++	static const char macos_dir[] = "/Library/GPUBundles/NativeAdrenoMetal.bundle/Contents/MacOS";
++	int lerr = native_gpu_addon_parents(p, scratch, "/Library/GPUBundles/NativeAdrenoMetal.bundle/Contents/MacOS/x");
++	if (!lerr) {
++		lerr = native_gpu_bundle_unprotect_one(macos_dir);
++	}
++	for (size_t i = 0; !lerr && i < sizeof(machos) / sizeof(machos[0]); ++i) {
++		char link_path[192], target[192], existing[256];
++		snprintf(link_path, sizeof(link_path), "%s/%s", macos_dir, machos[i]);
++		snprintf(target, sizeof(target),
++		    "/System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/NativeAdrenoMetal.bundle/Contents/MacOS/%s", machos[i]);
++		bool matches = false;
++		vnode_t lvp = NULLVP;
++		if (!vnode_lookup(link_path, VNODE_LOOKUP_NOFOLLOW, &lvp, kctx)) {
++			if (vnode_vtype(lvp) == VLNK) {
++				uio_t luio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++				if (luio) {
++					uio_addiov(luio, CAST_USER_ADDR_T(existing), sizeof(existing) - 1);
++					if (!VNOP_READLINK(lvp, luio, kctx) && uio_resid(luio) >= 0) {
++						size_t len = (size_t)(sizeof(existing) - 1 - uio_resid(luio));
++						if (len == strlen(target) && !memcmp(existing, target, len)) {
++							matches = true;
++						}
++					}
++					uio_free(luio);
++				}
++			}
++			vnode_put(lvp);
++		}
++		if (matches) {
++			(void)native_gpu_bundle_protect_one(link_path);
++			native_gpu_app_view_links++;
++			continue;
++		}
++		lerr = native_gpu_bundle_unprotect_one(link_path);
++		if (!lerr) {
++			struct unlink_args uargs = {.path = scratch + 0xc00};
++			int32_t ures = 0;
++			lerr = copyout(link_path, uargs.path, strlen(link_path) + 1);
++			if (!lerr) {
++				lerr = unlink(p, &uargs, &ures);
++				if (lerr == ENOENT) {
++					lerr = 0;
++				}
++			}
++		}
++		if (!lerr) {
++			struct symlink_args sargs = {.path = scratch + 0xc00, .link = scratch + 0xd80};
++			int32_t sres = 0;
++			lerr = copyout(target, sargs.path, strlen(target) + 1);
++			if (!lerr) {
++				lerr = copyout(link_path, sargs.link, strlen(link_path) + 1);
++			}
++			if (!lerr) {
++				lerr = symlink(p, &sargs, &sres);
++			}
++		}
++		if (!lerr) {
++			vnode_t resolved = NULLVP;
++			lerr = vnode_lookup(link_path, 0, &resolved, ctx);
++			if (!lerr) {
++				vnode_put(resolved);
++				native_gpu_app_view_links++;
++			}
++		}
++		(void)native_gpu_bundle_protect_one(link_path);
++	}
++	int perr = native_gpu_bundle_protect_one(macos_dir);
++	if (!lerr && perr) {
++		lerr = perr;
++	}
++	native_gpu_app_view_link_error = lerr;
++
++out:
++	native_gpu_app_view_status = error;
++	printf("owner Data: App-cryptex view stage %d status %d, links %d (%d)\n",
++	    native_gpu_app_view_stage, native_gpu_app_view_status, native_gpu_app_view_links, native_gpu_app_view_link_error);
++}
++
+ /* gpu-bundle-system=1: 1 both mounts made, 0 not asked, 0x1000 + errno the cover failed, else the errno of the union. */
+ volatile int native_gpu_bundle_system_view = 0;
+ static void
+@@ -9802,6 +10043,9 @@ native_owner_macos_gpu_addon(proc_t p, user_addr_t scratch)
+ 		native_gpu_bundle_system_view = error ? error : (cover ? 0x1000 + cover : 1);
+ 		printf("owner Data: GPU bundles over /System/Library/Extensions: %d, /Library/GPUBundles covered: %d\n", error, cover);
+ 	}
++	if (native_gpu_addon_stage == 5 && native_gpu_bundle_system_view != 1) {
++		native_owner_macos_gpu_app_cryptex_view(p, scratch);
++	}
+ 	if (native_gpu_addon_stage == 5) {
+ 		native_owner_macos_gpu_shader_cache(p, scratch, native_gpu_bundle_system_view == 1);
+ 	}

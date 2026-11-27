@@ -153,22 +153,22 @@ int main(void)
     sheng_battmgr_refresh(&b, 0);
     run_cycle(&b);
     sheng_battmgr_snapshot(&b, &s);
-    CHECK(s.percent == 20 && s.charge_known && !s.critical);
+    CHECK(s.percent == 20 && s.charge_known && !s.critical && s.raw_mah == 2000);
     board[0xa6] = 4800;  /* rounds: 5800 * 100 / 9800 = 59.18 */
     sheng_battmgr_refresh(&b, 0);
     run_cycle(&b);
     sheng_battmgr_snapshot(&b, &s);
-    CHECK(s.percent == 59);
+    CHECK(s.percent == 59 && s.raw_mah == 5800);
     board[0x8a] = 5000; board[0xa6] = 4900;  /* more than full reads 100 */
     sheng_battmgr_refresh(&b, 0);
     run_cycle(&b);
     sheng_battmgr_snapshot(&b, &s);
-    CHECK(s.percent == 100);
+    CHECK(s.percent == 100 && s.raw_mah == 9900);
     board_answers = 0;
     sheng_battmgr_refresh(&b, 0);
     run_cycle(&b);
     sheng_battmgr_snapshot(&b, &s);
-    CHECK(s.percent == 1 && s.charge_known && s.critical);
+    CHECK(s.percent == 1 && s.charge_known && s.critical && s.raw_mah == 3200);
     battery[4] = 180;
 
     /* A timeout skips the field in flight. */

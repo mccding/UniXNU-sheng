@@ -267,7 +267,7 @@ void sheng_battmgr_snapshot(const ShengBattmgr *b, ShengBatterySnapshot *s)
     /* -40 to 90 C; the firmware answers a fixed out-of-range value when it has no reading */
     s->temperature_valid = HAS(BmTemperature) && V(BmTemperature) >= -4000 && V(BmTemperature) <= 9000;
     s->temperature = s->temperature_valid ? V(BmTemperature) : 0;
-    s->raw_mah = HAS(BmCharge) ? V(BmCharge) / 1000 : 0;
+    s->raw_mah = gauges && remaining > 0 ? (int)remaining : HAS(BmCharge) ? V(BmCharge) / 1000 : 0;
     s->full_mah = HAS(BmFull) ? V(BmFull) / 1000 : 0;
     s->design_mah = HAS(BmDesign) ? V(BmDesign) / 1000 : 0;
     s->cycles = HAS(BmCycles) ? V(BmCycles) : 0;

@@ -101,6 +101,7 @@ jobs:
             UniXNU/out/feeds
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/gpu-reference
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/mesa-work
+            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/mesa-venv
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/adreno-metal-bridge
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/m2v-target
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/mesa-tu-macos27
@@ -405,7 +406,7 @@ jobs:
           assert rb_vendor_old in rb_src, 'missing vendor/product getters in NativeRamBlock.cpp'
           rb_src = rb_src.replace(rb_vendor_old, rb_vendor_new, 1)
           rb_stage_old = '  static constexpr uint32_t kStagePages = 32;'
-          rb_stage_new = '  static constexpr uint32_t kStagePages = 64;'
+          rb_stage_new = '  static constexpr uint32_t kStagePages = 256;'
           assert rb_stage_old in rb_src, 'missing kStagePages in NativeRamBlock.cpp'
           rb_src = rb_src.replace(rb_stage_old, rb_stage_new, 1)
           rb_start_old = '  online = true;\n  native_ram_block_ready = 1;\n  registerService();'
@@ -502,7 +503,201 @@ jobs:
               '    restart_icon_services || true',
           ])
           assert icon_old in icon_src, 'missing ICON_CACHE_FUNCTION rm block in build-boot-runtime.py'
-          icon_rt.write_text(icon_src.replace(icon_old, icon_new, 1))
+          bbr_src = icon_src.replace(icon_old, icon_new, 1)
+
+          bbr_venv_old = '\n'.join([
+              "    venv = ROOT / '.cache/mesa-venv'",
+              "    if not (venv / 'bin/python').is_file():",
+              "        run(sys.executable, '-m', 'venv', venv)",
+              "    run(venv / 'bin/python', '-m', 'pip', 'install', '-r', ROOT / 'scripts/requirements-adreno-compiler.txt')",
+          ])
+          bbr_venv_new = '\n'.join([
+              "    venv = ROOT / '.cache/mesa-venv'",
+              "    if not (venv / 'bin/python').is_file():",
+              "        shutil.rmtree(venv, ignore_errors=True)",
+              "        run(sys.executable, '-m', 'venv', venv)",
+              "    req = ROOT / 'scripts/requirements-adreno-compiler.txt'",
+              "    req_stamp = venv / '.reqs-sha256'",
+              "    req_hash = hashlib.sha256(req.read_bytes()).hexdigest()",
+              "    if not req_stamp.is_file() or req_stamp.read_text().strip() != req_hash:",
+              "        run(venv / 'bin/python', '-m', 'pip', 'install', '-r', req)",
+              "        req_stamp.write_text(req_hash + '\\n')",
+          ])
+          assert bbr_venv_old in bbr_src, 'missing mesa-venv block in build-boot-runtime.py'
+          bbr_src = bbr_src.replace(bbr_venv_old, bbr_venv_new, 1)
+
+          bbr_mount_old = '\n'.join([
+              "        if not seed.is_file() or (addon is None and want_addon):",
+              "            with os_mount(request['os_image'], work) as mount:",
+              "                if not seed.is_file():",
+              "                    if not request['init_data']:",
+              "                        raise SystemExit('refuse to generate Data without --init-data')",
+              "                    script('make-data-seed.py', mount, seed, '--gib', str(request['data_gib']),",
+              "                           '--build', request['build'], *(['--skip-setup'] if request.get('skip_setup') else []))",
+              "                if addon is None and want_addon:",
+              "                    prime_list = make_prime_list(request, work, mount) if request['target'] == 'macos27' else None",
+          ])
+          bbr_mount_new = '\n'.join([
+              "        need_mount = (not seed.is_file()) or (addon is None and want_addon and (",
+              "            (request['target'] == 'macos27' and not request.get('cached_prime_list'))",
+              "            or bool(request.get('wallpapers')) or bool(request.get('audio_system_plugins'))))",
+              "        if not seed.is_file() or (addon is None and want_addon):",
+              "            with (os_mount(request['os_image'], work) if need_mount else contextlib.nullcontext(None)) as mount:",
+              "                if not seed.is_file():",
+              "                    if not request['init_data']:",
+              "                        raise SystemExit('refuse to generate Data without --init-data')",
+              "                    script('make-data-seed.py', mount, seed, '--gib', str(request['data_gib']),",
+              "                           '--build', request['build'], *(['--skip-setup'] if request.get('skip_setup') else []))",
+              "                if addon is None and want_addon:",
+              "                    if request['target'] != 'macos27':",
+              "                        prime_list = None",
+              "                    elif request.get('cached_prime_list'):",
+              "                        cached_txt = Path(request['cached_prime_list'])",
+              "                        prime_list = ROOT / 'build/prime-list.txt'",
+              "                        prime_list.parent.mkdir(parents=True, exist_ok=True)",
+              "                        shutil.copy2(cached_txt, prime_list)",
+              "                        shutil.copy2(cached_txt.with_suffix('.json'), prime_list.with_suffix('.json'))",
+              "                    else:",
+              "                        prime_list = make_prime_list(request, work, mount)",
+              "                        rc = os.environ.get('UNIXNU_RUNTIME_CACHE')",
+              "                        if rc:",
+              "                            rc_dir = Path(rc)",
+              "                            rc_dir.mkdir(parents=True, exist_ok=True)",
+              "                            shutil.copy2(prime_list, rc_dir / 'prime-list.txt')",
+              "                            shutil.copy2(prime_list.with_suffix('.json'), rc_dir / 'prime-list.json')",
+          ])
+          assert bbr_mount_old in bbr_src, 'missing os_mount/make_prime_list block in build-boot-runtime.py'
+          bbr_src = bbr_src.replace(bbr_mount_old, bbr_mount_new, 1)
+
+          bbr_bt_old = '\n'.join([
+              "        if request.get('bluetooth_tool'):",
+              "            bluetooth = work / 'bluetooth'",
+              "            mount_work = work / 'bluetooth-os'",
+              "            mount_work.mkdir()",
+              "            with os_mount(request['os_image'], mount_work) as mount:",
+              "                component = request.get('bluetooth_component')",
+              "                run(sys.executable, Path(request['device']) / request['bluetooth_tool'],",
+              "                    bluetooth, request['bluetooth_target'], '--os-root', mount,",
+              "                    *(['--component', component] if component else []))",
+          ])
+          bbr_bt_new = '\n'.join([
+              "        if request.get('bluetooth_tool'):",
+              "            if request.get('cached_bluetooth'):",
+              "                bluetooth = Path(request['cached_bluetooth'])",
+              "            else:",
+              "                bluetooth = work / 'bluetooth'",
+              "                mount_work = work / 'bluetooth-os'",
+              "                mount_work.mkdir()",
+              "                with os_mount(request['os_image'], mount_work) as mount:",
+              "                    component = request.get('bluetooth_component')",
+              "                    run(sys.executable, Path(request['device']) / request['bluetooth_tool'],",
+              "                        bluetooth, request['bluetooth_target'], '--os-root', mount,",
+              "                        *(['--component', component] if component else []))",
+              "                rc = os.environ.get('UNIXNU_RUNTIME_CACHE')",
+              "                if rc:",
+              "                    rc_bt = Path(rc) / 'bluetooth'",
+              "                    shutil.rmtree(rc_bt, ignore_errors=True)",
+              "                    rc_bt.parent.mkdir(parents=True, exist_ok=True)",
+              "                    shutil.copytree(bluetooth, rc_bt)",
+          ])
+          assert bbr_bt_old in bbr_src, 'missing bluetooth_tool block in build-boot-runtime.py'
+          bbr_src = bbr_src.replace(bbr_bt_old, bbr_bt_new, 1)
+
+          bbr_trust_old = '\n'.join([
+              "        if trust is None:",
+              "            original = work / 'apple-trust.bundle'",
+              "            script('bundle-ipsw-trust.py', original, *request['trust_modules'])",
+          ])
+          bbr_trust_new = '\n'.join([
+              "        if trust is None:",
+              "            original = work / 'apple-trust.bundle'",
+              "            if request.get('cached_apple_trust'):",
+              "                shutil.copy2(request['cached_apple_trust'], original)",
+              "            else:",
+              "                script('bundle-ipsw-trust.py', original, *request['trust_modules'])",
+              "                rc = os.environ.get('UNIXNU_RUNTIME_CACHE')",
+              "                if rc:",
+              "                    rc_dir = Path(rc)",
+              "                    rc_dir.mkdir(parents=True, exist_ok=True)",
+              "                    shutil.copy2(original, rc_dir / 'apple-trust.bundle')",
+          ])
+          assert bbr_trust_old in bbr_src, 'missing apple-trust block in build-boot-runtime.py'
+          icon_rt.write_text(bbr_src.replace(bbr_trust_old, bbr_trust_new, 1))
+
+          fw_py = Path('UniXNU/scripts/unixnu/firmware.py')
+          fw_src = fw_py.read_text()
+          fw_pre_old = "def preflight_toolchain(ctx):\n    \"\"\"Resolve the firmware toolchain before starting other requested builds.\"\"\"\n    selected = ctx.option('clang_bin', 'CLANG_BIN')"
+          fw_pre_new = "def preflight_toolchain(ctx):\n    \"\"\"Resolve the firmware toolchain before starting other requested builds.\"\"\"\n    if os.environ.get('UNIXNU_REUSE_UEFI') == '1':\n        return\n    selected = ctx.option('clang_bin', 'CLANG_BIN')"
+          assert fw_pre_old in fw_src, 'missing preflight_toolchain in firmware.py'
+          fw_src = fw_src.replace(fw_pre_old, fw_pre_new, 1)
+          fw_bld_old = "    base, size = config['uefi_fd']['base'], config['uefi_fd']['size']"
+          fw_bld_new = '\n'.join([
+              "    base, size = config['uefi_fd']['base'], config['uefi_fd']['size']",
+              "    fd = fd_path(ctx, uefi, target)",
+              "    if os.environ.get('UNIXNU_REUSE_UEFI') == '1' and fd.is_file() and fd.stat().st_size == size:",
+              "        log(f'firmware: reusing cached {fd}')",
+              "        return fd",
+          ])
+          assert fw_bld_old in fw_src, 'missing uefi_fd size in firmware.py'
+          fw_py.write_text(fw_src.replace(fw_bld_old, fw_bld_new, 1))
+
+          rt_py = Path('UniXNU/scripts/unixnu/runtime.py')
+          rt_src = rt_py.read_text()
+          rt_old = '\n'.join([
+              "    if (not seed.is_file() or not trust or (want_addon and not addon) or spec.get('wifi_tool') or spec.get('bluetooth_tool') or spec.get('appsync') or",
+              "            spec.get('firmware_tools')):",
+              "        source = Ipsw(ctx)",
+              "        if not seed.is_file() or (want_addon and not addon) or spec.get('wifi_launchd_cache') or spec.get('bluetooth_tool') or spec.get('appsync'):",
+              "            request['os_image'] = str(source.disk_image('OS'))",
+              "        if want_addon and not addon and spec.get('target') == 'macos27':",
+              "            prefixes = {'OS': '/', 'SystemOS': '/System/Cryptexes/OS', 'App': '/System/Cryptexes/App'}",
+              "            request['prime_images'] = [dict(name=window['name'], image=str(source.disk_image(window['component'])),",
+              "                                          prefix=prefixes[window['name']])",
+              "                                       for window in ctx.board['userdata']['windows']]",
+              "        if not trust:",
+              "            request['trust_modules'] = [str(source.extract(name)) for name in spec['trust_components']]",
+          ])
+          rt_new = '\n'.join([
+              "    if (not seed.is_file() or not trust or (want_addon and not addon) or spec.get('wifi_tool') or spec.get('bluetooth_tool') or spec.get('appsync') or",
+              "            spec.get('firmware_tools')):",
+              "        cache_dir = Path(os.environ['UNIXNU_RUNTIME_CACHE']) if os.environ.get('UNIXNU_RUNTIME_CACHE') else None",
+              "        prime_txt = cache_dir / 'prime-list.txt' if cache_dir else None",
+              "        prime_json = cache_dir / 'prime-list.json' if cache_dir else None",
+              "        cached_prime = bool(prime_txt and prime_txt.is_file() and prime_txt.stat().st_size > 0 and prime_json.is_file())",
+              "        bt_dir = cache_dir / 'bluetooth' if cache_dir else None",
+              "        cached_bt = False",
+              "        if bt_dir and (bt_dir / 'report.json').is_file():",
+              "            try:",
+              "                bt_rep = json.loads((bt_dir / 'report.json').read_text())",
+              "                cached_bt = all((bt_dir / rel).exists() for rel in bt_rep.get('directories', {}).values())",
+              "            except Exception:",
+              "                cached_bt = False",
+              "        apple_trust = cache_dir / 'apple-trust.bundle' if cache_dir else None",
+              "        cached_trust = bool(apple_trust and apple_trust.is_file() and apple_trust.stat().st_size > 0)",
+              "        need_prime = want_addon and not addon and spec.get('target') == 'macos27' and not cached_prime",
+              "        need_bt = bool(spec.get('bluetooth_tool')) and not cached_bt",
+              "        need_trust = (not trust) and not cached_trust",
+              "        need_os = (not seed.is_file()) or (want_addon and not addon and spec.get('target') != 'macos27') or (bool(spec.get('wallpapers')) and want_addon and not addon) or (bool(spec.get('audio_system_plugins')) and want_addon and not addon) or bool(spec.get('wifi_launchd_cache')) or need_bt or bool(spec.get('appsync'))",
+              "        if need_os or need_prime or need_trust:",
+              "            source = Ipsw(ctx)",
+              "        if need_os:",
+              "            request['os_image'] = str(source.disk_image('OS'))",
+              "        if need_prime:",
+              "            prefixes = {'OS': '/', 'SystemOS': '/System/Cryptexes/OS', 'App': '/System/Cryptexes/App'}",
+              "            request['prime_images'] = [dict(name=window['name'], image=str(source.disk_image(window['component'])),",
+              "                                          prefix=prefixes[window['name']])",
+              "                                       for window in ctx.board['userdata']['windows']]",
+              "        if cached_prime and want_addon and not addon and spec.get('target') == 'macos27':",
+              "            request['cached_prime_list'] = str(prime_txt)",
+              "        if cached_bt and spec.get('bluetooth_tool'):",
+              "            request['cached_bluetooth'] = str(bt_dir)",
+              "        if need_trust:",
+              "            request['trust_modules'] = [str(source.extract(name)) for name in spec['trust_components']]",
+              "        elif cached_trust and not trust:",
+              "            request['cached_apple_trust'] = str(apple_trust)",
+          ])
+          assert rt_old in rt_src, 'missing Ipsw block in runtime.py'
+          rt_py.write_text(rt_src.replace(rt_old, rt_new, 1))
           print('Applied Stage 1, Stage 2, and Stage 3 patches.')
           PY
       - name: Refresh pinned translator checkout
@@ -558,13 +753,56 @@ jobs:
           python3 device/scripts/check-lid-clamshell-host.py
           python3 device/scripts/check-backlight-host.py
           python3 device/scripts/check-piano-wn8030-host.py
+          python3 device/scripts/check-battery-host.py
+      - name: Identify UEFI cache
+        id: uefi-key
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, os, subprocess
+          from pathlib import Path
+          h = hashlib.sha256(b'sheng-uefi-v1\n')
+          h.update(subprocess.check_output(['git', '-C', 'uefi-sheng', 'rev-parse', 'HEAD']))
+          h.update(subprocess.check_output(['git', '-C', 'UniXNU', 'rev-parse', 'HEAD:drivers/DarwinBoot', 'HEAD:scripts/unixnu/firmware.py']))
+          for p in ('device/unixnu.lock', 'device/proprietary-files.txt', 'device/scripts/import-sheng-uefi.py',
+                    'device/scripts/check-sheng.py', 'device/scripts/fetch-sheng-dts.py', 'device/dts/sheng.dts',
+                    'device/board.toml'):
+              h.update(p.encode() + b'\n')
+              h.update(Path(p).read_bytes())
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              output.write('key=sheng-uefi-v1-' + h.hexdigest()[:16] + '\n')
+          PYTHON
+      - name: Restore UEFI cache
+        id: uefi-cache
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ steps.uefi-key.outputs.key }}
+          path: uefi-sheng/Build/shengPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd
+      - name: Restore rustup cache
+        id: rustup-cache
+        uses: actions/cache/restore@v4
+        with:
+          key: sheng-rustup-1.98.0-${{ runner.os }}
+          path: ~/.rustup
       - name: Install build tools
         run: |
-          brew install dtc llvm lld llvm@22 lld@22 cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef openssl@3 zstd blacktop/tap/ipsw
+          if [ '${{ steps.uefi-cache.outputs.cache-hit }}' = 'true' ]; then
+            brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef openssl@3 zstd blacktop/tap/ipsw
+            echo "UNIXNU_REUSE_UEFI=1" >> "$GITHUB_ENV"
+          else
+            brew install dtc llvm lld llvm@22 lld@22 cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef openssl@3 zstd blacktop/tap/ipsw
+          fi
           {
             echo "$HOME/.cargo/bin"
             echo "/opt/homebrew/opt/bison/bin"
           } >> "$GITHUB_PATH"
+          if ! rustup toolchain list | grep -q '^1\.98\.0'; then
+            rustup toolchain install 1.98.0 --profile minimal --component rust-src
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Configure UEFI toolchain
+        if: steps.uefi-cache.outputs.cache-hit != 'true'
+        run: |
           python3 - <<'PYTHON'
           from pathlib import Path
           toolchain = Path('uefi-toolchain').resolve()
@@ -575,9 +813,6 @@ jobs:
           with Path(__import__('os').environ['GITHUB_ENV']).open('a') as output:
               output.write('CLANG_BIN=' + str(toolchain) + '/\n')
           PYTHON
-          rustup toolchain install 1.98.0 --profile minimal --component rust-src
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
       - name: Identify kernel SDK cache
         id: kernel-sdk
         run: |
@@ -600,6 +835,38 @@ jobs:
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/xnu-work
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/fakeroot
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/xnu
+      - name: Identify IPSW runtime cache
+        id: runtime-key
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, os
+          from pathlib import Path
+          h = hashlib.sha256(b'sheng-runtime-v1\n')
+          for p in ('UniXNU/profiles/os/macos-27.3-26C5035r/profile.toml',
+                    'UniXNU/scripts/list-metal-libraries.py',
+                    'UniXNU/scripts/bundle-ipsw-trust.py',
+                    'device/scripts/build-bluetooth-userspace.py',
+                    'device/unixnu.lock'):
+              h.update(p.encode() + b'\n')
+              h.update(Path(p).read_bytes())
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              output.write('key=sheng-macos27-runtime-v1-' + h.hexdigest()[:16] + '\n')
+          PYTHON
+      - name: Restore IPSW runtime cache
+        id: runtime-cache
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ steps.runtime-key.outputs.key }}
+          path: UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime-cache
+      - name: Configure runtime cache
+        run: |
+          cache="$PWD/UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime-cache"
+          echo "UNIXNU_RUNTIME_CACHE=$cache" >> "$GITHUB_ENV"
+          if [ -d "$cache/ipsw-small" ]; then
+            ipsw_dir="UniXNU/out/ipsw/26C5035r"
+            mkdir -p "$ipsw_dir"
+            cp -R "$cache/ipsw-small/." "$ipsw_dir/"
+          fi
       - name: Prepare installation
         working-directory: UniXNU
         run: |
@@ -626,7 +893,12 @@ jobs:
       - name: Build images
         id: build-images
         working-directory: device
-        run: scripts/package.sh --os macos-27 --uefi ../uefi-sheng
+        run: |
+          if [ '${{ steps.runtime-cache.outputs.cache-hit }}' = 'true' ]; then
+            scripts/package.sh --os macos-27 --uefi ../uefi-sheng --no-deps
+          else
+            scripts/package.sh --os macos-27 --uefi ../uefi-sheng
+          fi
       - name: Publish shader inventory
         if: always()
         uses: actions/upload-artifact@v4
@@ -691,6 +963,7 @@ jobs:
             UniXNU/out/feeds
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/gpu-reference
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/mesa-work
+            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/mesa-venv
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/adreno-metal-bridge
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/m2v-target
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/mesa-tu-macos27
@@ -713,3 +986,35 @@ jobs:
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/xnu-work
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/fakeroot
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/xnu
+      - name: Stage IPSW small cache
+        if: always() && steps.build-images.outcome == 'success' && steps.runtime-cache.outputs.cache-hit != 'true'
+        run: |
+          python3 - <<'PY'
+          import shutil
+          from pathlib import Path
+          ipsw_dir = Path('UniXNU/out/ipsw/26C5035r')
+          out_dir = Path('UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime-cache/ipsw-small')
+          out_dir.mkdir(parents=True, exist_ok=True)
+          for p in sorted(ipsw_dir.iterdir()) if ipsw_dir.is_dir() else ():
+              if not p.is_file() or p.name.endswith(('.dmg', '.dmg.aea', '.raw', '.partial')) or p.stat().st_size > 150 * 1024 * 1024:
+                  continue
+              shutil.copy2(p, out_dir / p.name)
+          PY
+      - name: Save IPSW runtime cache
+        if: always() && steps.build-images.outcome == 'success' && steps.runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.runtime-key.outputs.key }}
+          path: UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime-cache
+      - name: Save UEFI cache
+        if: always() && steps.build-images.outcome == 'success' && steps.uefi-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.uefi-key.outputs.key }}
+          path: uefi-sheng/Build/shengPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd
+      - name: Save rustup cache
+        if: always() && steps.build-images.outcome == 'success' && steps.rustup-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: sheng-rustup-1.98.0-${{ runner.os }}
+          path: ~/.rustup

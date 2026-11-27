@@ -42,28 +42,50 @@ int main() {
     s.keepalive = 12000;
     s.pollDue = 5000;
 
-    // A single rising edge reads ONCE (no 2x wasted extra read when lineHigh drops or even briefly stays high unless bursting Valid).
-    io.edges = 1; io.lineHigh = true; io.readResult = KeyboardRead::Valid;
+    // A single rising edge drains valid frames up to drainBudget; stayed-high IRQ after Valid stops on Empty without 20 Hz hammering.
+    io.edges = 1; io.lineHigh = true; io.emptyThenValid = 2;  // 1st read Empty -> irqWasLow cleared
     s.step(io);
-    // Because flood=false and lineHigh stayed true after Valid, burst attempts read 2; set readResult=Empty on next read to confirm stop:
-    CHECK(s.seen == 1 && io.reads == KeyboardService::drainBudget);
-    io.lineHigh = false; s.highBackoffDue = 0;
-    io.edges = 2; io.reads = 0;
+    CHECK(s.seen == 1 && io.reads == 1 && !s.irqWasLow);
+    CHECK(s.deadline(io.clock, io.edges, io.irqHigh()) == s.pollDue);
+    // While PinIrq stays high after an Empty read, extra steps before pollDue do ZERO I2C reads (no 20 Hz bus hammering).
+    io.clock += 200;
     s.step(io);
-    CHECK(s.seen == 2 && io.reads == 1 && !s.highBackoffDue);
+    CHECK(io.reads == 1 && s.deadline(io.clock, io.edges, io.irqHigh()) == s.pollDue);
+    // Insurance poll at pollDue reads even if PinIrq stayed high (and picks up the now-Valid frame).
+    io.clock = s.pollDue;
+    s.step(io);
+    CHECK(io.reads == 2 && io.activities > 0);
+    io.lineHigh = false; io.emptyThenValid = 0;
+    s.step(io);
+    CHECK(s.irqWasLow && io.reads == 2);
 
-    // M0 deadlock regression test: Empty read with lineHigh=true must NOT latch forever; backs off 50ms then resumes reading.
-    io.reads = 0; io.lineHigh = true; io.readResult = KeyboardRead::Empty;
+    // Missed rising edge (irqWasLow == true, lineHigh == true, irqs == seen): deadline is immediate and step reads.
+    io.lineHigh = true; io.readResult = KeyboardRead::Valid; io.reads = 0;
+    CHECK(s.deadline(io.clock, io.edges, io.irqHigh()) == io.clock);
     s.step(io);
-    CHECK(io.reads == 1 && s.highBackoffDue == io.clock + KeyboardService::highBackoffMs);
-    const uint64_t backoffAt = s.highBackoffDue;
-    CHECK(s.deadline(io.clock, io.edges, io.irqHigh()) <= backoffAt);
+    CHECK(io.reads == KeyboardService::drainBudget && s.irqWasLow);  // budget hit keeps irqWasLow true so remaining frames drain immediately
+    CHECK(s.deadline(io.clock, io.edges, io.irqHigh()) == io.clock);
+    // Drain remaining 4 valid frames then go low/idle.
+    struct BurstMock : Mock {
+        unsigned validLeft = 0;
+        KeyboardRead read() {
+            ++reads; ++clock;
+            if (validLeft > 0) { --validLeft; return KeyboardRead::Valid; }
+            return KeyboardRead::Empty;
+        }
+    } burst;
+    KeyboardService sb; burst.service = &sb; sb.keepalive = 12000; sb.pollDue = 5000;
+    burst.edges = 1; burst.lineHigh = true; burst.validLeft = 12;
+    sb.step(burst);
+    CHECK(sb.seen == 1 && burst.reads == KeyboardService::drainBudget && sb.irqWasLow);
+    CHECK(sb.deadline(burst.clock, burst.edges, burst.irqHigh()) == burst.clock);
+    sb.step(burst);
+    CHECK(burst.reads == 13 && !sb.irqWasLow);   // 4 valid + 1 Empty stops burst and clears irqWasLow
+    burst.lineHigh = false;
+
+    io.edges = 2; io.reads = 0; io.lineHigh = false; s.irqWasLow = true;
     s.step(io);
-    CHECK(io.reads == 1);   // respects 50 ms backoff, no spin!
-    io.clock = backoffAt; io.readResult = KeyboardRead::Valid;
-    s.step(io);
-    CHECK(io.reads == 1 + KeyboardService::drainBudget && !s.highBackoffDue && io.activities > 0);   // recovers automatically without edge!
-    io.lineHigh = false;
+    CHECK(s.seen == 2 && io.reads == 1);
 
     // Failed read does not consume its edge; retry without any new interrupt succeeds.
     io.edges = 3; io.readResult = KeyboardRead::Error; io.reads = 0;

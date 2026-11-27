@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <dispatch/dispatch.h>
 #include <string.h>
 #include <os/log.h>
 #include "ShengAudioAbi.h"
@@ -41,6 +42,7 @@ static io_connect_t gConnect;
 static ShengAudioControl *gControl;
 static int16_t *gOut, *gIn;
 static UInt32 gIoUsers;
+static atomic_int gInputState = 0;   // 0 stopped, 1 starting, 2 started
 static Float32 gVolume = 1.0f;   // the volume control's scalar (slider position)
 static Float64 gHostTicksPerFrame;
 static void setHostClock(void);
@@ -562,6 +564,21 @@ __attribute__((constructor)) static void watchAudioServer(void) {_dyld_register_
 #endif
 
 // ---- IO ----------------------------------------------------------------------------------------------------------------------------
+static void ensureInputStartedAsync(void) {
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&gInputState, &expected, 1)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        pthread_mutex_lock(&gLock);
+        if (gIoUsers > 0 && gControl && atomic_load(&gInputState) == 1) {
+            if (call(ShengAudioStartInput) == KERN_SUCCESS) atomic_store(&gInputState, 2);
+            else atomic_store(&gInputState, 0);
+        } else {
+            int s = 1;
+            atomic_compare_exchange_strong(&gInputState, &s, 0);
+        }
+        pthread_mutex_unlock(&gLock);
+    });
+}
 static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 client) {
     (void)d; (void)client;
     if (o != kDevice) return kAudioHardwareBadObjectError;
@@ -571,10 +588,10 @@ static OSStatus StartIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 cl
         if (connectService()) r = kAudioHardwareNotRunningError;
         else if (!gControl) r = kAudioHardwareNotRunningError;
         else {
+            atomic_store(&gInputState, 0);
             setHostClock();   // again: the shared page may have been read back from disk since
             if (call(ShengAudioStartOutput) != KERN_SUCCESS) r = kAudioHardwareNotRunningError;
             else {
-                call(ShengAudioStartInput);
                 const uint64_t host = mach_absolute_time(), anchor = gControl->out_anchor_host;
                 gZeroOrigin = host > anchor ? (uint64_t)((Float64)(host - anchor) / gHostTicksPerFrame) : 0;
                 gZeroSeed++;
@@ -589,7 +606,10 @@ static OSStatus StopIO(AudioServerPlugInDriverRef d, AudioObjectID o, UInt32 cli
     (void)d; (void)client;
     if (o != kDevice) return kAudioHardwareBadObjectError;
     pthread_mutex_lock(&gLock);
-    if (gIoUsers && --gIoUsers == 0) {call(ShengAudioStopOutput); call(ShengAudioStopInput);}
+    if (gIoUsers && --gIoUsers == 0) {
+        call(ShengAudioStopOutput);
+        if (atomic_exchange(&gInputState, 0) == 2) call(ShengAudioStopInput);
+    }
     pthread_mutex_unlock(&gLock);
     return 0;
 }
@@ -690,6 +710,7 @@ static OSStatus DoIOOperation(AudioServerPlugInDriverRef d, AudioObjectID o, Aud
         if (t > gControl->out_written) gControl->out_written = t;
         gControl->out_written_host = host;
     } else if (op == kAudioServerPlugInIOOperationReadInput && stream == kInStream) {
+        ensureInputStartedAsync();
         // Frames the service has not captured yet read as silence, not as what the ring held one turn earlier; such reads are counted.
         const int32_t behind = (int32_t)(nowFrames - (int64_t)info->mInputTime.mSampleTime);
         if (!diag->behind_max || behind < diag->behind_min) diag->behind_min = behind;

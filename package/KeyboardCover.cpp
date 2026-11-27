@@ -158,6 +158,10 @@ public:
             }
             return;
         }
+        {
+            uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+            publishTiming(static_cast<uint32_t>(ns / 1000000));
+        }
 #endif
         uint8_t copy[kLongestReport];
         memcpy(copy, bytes, length);

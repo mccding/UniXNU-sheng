@@ -445,7 +445,9 @@ bool applyInputState() {
     Keyboard *kb = gKb;
     if (!kb->attached) return true;
     const bool on = kb->inputEnabled;
-    bool ok = control(WN8030_CMD_TOUCHPAD, on ? 1 : 0);
+    bool ok = true;
+    if (on) ok = control(WN8030_CMD_KEYBOARD_POWER, 1) && ok;
+    ok = control(WN8030_CMD_TOUCHPAD, on ? 1 : 0) && ok;
     ok = control(WN8030_CMD_INDICATOR, on && kb->caps ? WN8030_LED_CAPS_ON : WN8030_LED_CAPS_OFF) && ok;
     ok = control(WN8030_CMD_INDICATOR, WN8030_LED_MIC_OFF) && ok;
     const uint32_t bl = kb->kbdBacklight.level();
@@ -660,14 +662,13 @@ KeyboardRead handleFrame() {
         break;
     case Wn8030Attach:
         if (f.attached == 1) {
+            const bool wasDetachPending = kb->detachPending;
             kb->detachPending = false;
             if (!kb->attached) {
                 attachCover();
-            } else {
+            } else if (wasDetachPending) {
                 kb->service.statePending = true;
                 kb->service.keepalive = nowMs();
-                kb->kbdBacklight.detach();
-                (void)kb->kbdBacklight.attach(nowMs());
                 if (sheng_battery_keyboard_attached) sheng_battery_keyboard_attached(1);
             }
         } else if (f.attached == 0 && kb->attached) {
@@ -776,7 +777,7 @@ void serve() {
                 setOutput(PinSleep, true); IOSleep(25);
                 kb->service.statePending = true;
             }
-            kb->service.highBackoffDue = 0;
+            kb->service.irqWasLow = !io.irqHigh();
             kb->service.keepalive = nowMs();
             kb->service.pollDue = nowMs();
         }

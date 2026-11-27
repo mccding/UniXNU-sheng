@@ -1839,6 +1839,7 @@ volatile uint32_t native_gpu_dcvs_reasons[9];
 // 191 s), so some window in every 80 ms shows work there and the GPU never counts as rested; [1] to [3] tell which kind of work.
 volatile uint32_t native_gpu_dcvs_windows[8];
 extern volatile uint32_t native_hid_input_events[8] __attribute__((weak_import));
+extern volatile int32_t native_thermal_now[8] __attribute__((weak_import));
 }
 uint64_t gpuBusyTicks() {
     ShengGmuIo &io = gColdDevice.io;
@@ -1898,7 +1899,7 @@ void gpuPerfTick(uint64_t busyTicks) {
 }
 void gpuDcvsThread(void *, wait_result_t) {
     ShengGmuIo &io = gColdDevice.io;
-    unsigned floor = bootArg("gpu-dcvs-min", 3);
+    unsigned floor = bootArg("gpu-dcvs-min", 1);
     if (floor < 1) floor = 1;
     if (floor > kGpuTop) floor = kGpuTop;
     io.write32(io.cookie, ShengGmuCore, kGmuReg(0x23b0e), 0xff000000u);
@@ -1911,7 +1912,7 @@ void gpuDcvsThread(void *, wait_result_t) {
     native_gpu_dcvs[0] = 1; native_gpu_dcvs[1] = cur;
     uint64_t lastBusy = gpuBusyTicks(), lastT = mach_absolute_time(), idleSince = lastT;
     uint64_t runNs = 0, winBusy = 0, winNs = 0, atLevel[kGpuTop + 1] = {};
-    unsigned down = 0, hold = 0;
+    unsigned down = 0, hold = 0, thermCap = kGpuTop;
     unsigned span = bootArg("gpu-dcvs-span", 1);
     if (span < 1) span = 1;
     if (span > kGpuSpanMax) span = kGpuSpanMax;
@@ -1922,13 +1923,15 @@ void gpuDcvsThread(void *, wait_result_t) {
     unsigned spanAt = 0, keptAt = 0, spanActive = 0;
     uint32_t seen = 0, seenBusy = 0, seenFaint = 0, seenRing = 0, longestUs = 0, longestMHz = 0;
     uint64_t boostAbs = 0, touchEnd = 0, wakeEnd = 0, wakeAbs = 0;
-    nanoseconds_to_absolutetime((uint64_t)bootArg("gpu-dcvs-boost-ms", 1000) * 1000000, &boostAbs);
+    nanoseconds_to_absolutetime((uint64_t)bootArg("gpu-dcvs-boost-ms", 250) * 1000000, &boostAbs);
     nanoseconds_to_absolutetime(50000000ull, &wakeAbs);
+    const bool wakeBoost = bootArg("gpu-dcvs-wake", 0) != 0;
+    const bool thermalCapOn = bootArg("gpu-thermal-cap", 1) != 0;
     uint32_t touches = &native_hid_input_events ? native_hid_input_events[6] : 0;
-    bool idle = false;
+    bool idle = false, atRest = false;
     const bool tracePerf=bootArg("gpu-perf",0)==1;unsigned perfTick=0;
     for (;;) {
-        IOSleep(16);
+        IOSleep(atRest ? 64 : 16);
         const uint64_t busy = gpuBusyTicks(), t = mach_absolute_time();
         if(tracePerf && !(++perfTick&1))gpuPerfTick(busy);
         uint64_t ns = 0;
@@ -1985,7 +1988,7 @@ void gpuDcvsThread(void *, wait_result_t) {
         if (rested && !idle) native_gpu_dcvs_windows[6] = native_gpu_dcvs_windows[6] + 1;
         if (rested) idle = true;
         if (active && idle) {
-            idle = false; wakeEnd = t + wakeAbs; native_gpu_dcvs[14] = native_gpu_dcvs[14] + 1;
+            idle = false; if (wakeBoost) wakeEnd = t + wakeAbs; native_gpu_dcvs[14] = native_gpu_dcvs[14] + 1;
         }
         if (boostAbs && &native_hid_input_events && native_hid_input_events[6] != touches) {
             touches = native_hid_input_events[6];
@@ -1993,9 +1996,21 @@ void gpuDcvsThread(void *, wait_result_t) {
             touchEnd = t + boostAbs;
         }
         if (t < touchEnd) {want = kGpuTop;reason = 5;}
-        else if (t < wakeEnd) {
+        else if (wakeBoost && t < wakeEnd) {
             const unsigned wake = gpuLevelFor(kGpuMHz[cur] * 2 > 578 ? kGpuMHz[cur] * 2 : 578);
             if (want < wake) {want = wake;reason = 6;}
+        }
+        if (thermalCapOn && &native_thermal_now) {
+            const int32_t gpuMc = native_thermal_now[4];   // THERMAL_GROUP_GPU, millidegrees C
+            if (gpuMc > 0 && gpuMc < 130000) {
+                if (gpuMc >= 86000) thermCap = 4;                         // >= 86 C -> 401 MHz
+                else if (gpuMc >= 80000 && thermCap > 5) thermCap = 5;    // >= 80 C -> 475 MHz
+                else if (gpuMc >= 74000 && thermCap > 6) thermCap = 6;    // >= 74 C -> 550 MHz
+                else if (thermCap == 4 && gpuMc <= 80000) thermCap = 5;
+                else if (thermCap == 5 && gpuMc <= 75000) thermCap = 6;
+                else if (thermCap == 6 && gpuMc <= 69000) thermCap = kGpuTop;
+            }
+            if (want > thermCap) want = thermCap;
         }
         if (want < floor) {want = floor;reason = 7;}
         if (want != cur) {
@@ -2021,6 +2036,7 @@ void gpuDcvsThread(void *, wait_result_t) {
             native_gpu_dcvs_windows[3] = seenRing; native_gpu_dcvs_windows[4] = longestUs; native_gpu_dcvs_windows[5] = longestMHz;
             seen = seenBusy = seenFaint = seenRing = longestUs = longestMHz = 0;
         }
+        atRest = idle && cur == floor && t >= touchEnd;
     }
 }
 void startGpuDcvs() {

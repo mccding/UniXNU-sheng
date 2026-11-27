@@ -8,9 +8,9 @@
 enum class KeyboardRead : uint8_t { Error = 0, Empty = 1, Valid = 2 };
 
 struct KeyboardService {
-    static constexpr uint32_t keepaliveMs = 12000, retryMs = 100, highBackoffMs = 50, drainBudget = 8;
+    static constexpr uint32_t keepaliveMs = 12000, retryMs = 100, drainBudget = 8;
     uint32_t seen = 0, readFailures = 0, controlFailures = 0, recoveryTries = 0;
-    uint64_t keepalive = 0, retryDue = 0, recoveryDue = 0, pollDue = 0, highBackoffDue = 0;
+    uint64_t keepalive = 0, retryDue = 0, recoveryDue = 0, pollDue = 0;
     bool statePending = false, recovering = false, irqWasLow = true;
 
     template <typename IO> void step(IO &io) {
@@ -24,7 +24,6 @@ struct KeyboardService {
             recovering = false;
             recoveryTries = readFailures = controlFailures = 0;
             retryDue = 0;
-            highBackoffDue = 0;
             irqWasLow = !io.irqHigh();
             statePending = io.attached();
             keepalive = io.now();
@@ -34,9 +33,10 @@ struct KeyboardService {
         retryDue = 0;
         // Drain edge-triggered and buffered frames: never follow an Empty read on the same wake (prevents 2x reads and irqEmpty lockup).
         bool prevValid = false;
+        bool budgetHit = false;
         for (unsigned n = 0; n < drainBudget; ++n) {
             const bool hadEdge = seen != io.irqs();
-            const bool highReady = io.irqHigh() && (n == 0 ? io.now() >= highBackoffDue : prevValid);
+            const bool highReady = io.irqHigh() && (n == 0 ? irqWasLow : prevValid);
             if (!hadEdge && !highReady) break;
             const KeyboardRead r = io.read();
             if (r == KeyboardRead::Error) {
@@ -49,18 +49,16 @@ struct KeyboardService {
             readFailures = 0;
             if (r == KeyboardRead::Valid) {
                 prevValid = true;
-                highBackoffDue = 0;
                 io.activity(io.now());
                 pollDue = io.now() + io.pollIntervalMs();
+                if (n + 1 == drainBudget && io.irqHigh()) budgetHit = true;
             } else {
                 prevValid = false;
-                highBackoffDue = io.irqHigh() ? io.now() + highBackoffMs : 0;
                 break;
             }
         }
-        if (!io.irqHigh()) {
+        if (!io.irqHigh() || budgetHit) {
             irqWasLow = true;
-            highBackoffDue = 0;
         } else {
             irqWasLow = false;
         }
@@ -104,10 +102,9 @@ struct KeyboardService {
     uint64_t deadline(uint64_t now, uint32_t irqs, bool irqHigh = false) const {
         if (recovering) return recoveryDue;
         if (retryDue) return retryDue;
-        if (seen != irqs || statePending || (irqHigh && now >= highBackoffDue)) return now;
+        if (seen != irqs || statePending || (irqHigh && irqWasLow)) return now;
         uint64_t due = keepalive;
         if (pollDue && pollDue < due) due = pollDue;
-        if (irqHigh && highBackoffDue && highBackoffDue < due) due = highBackoffDue;
         return due;
     }
 };

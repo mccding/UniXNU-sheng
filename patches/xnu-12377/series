@@ -29,4 +29,5 @@ sheng-virtual-address-size-47.patch
 sheng-kmem-contig-ungobble.patch
 sheng-panic-text-scanout.patch
 sheng-export-merged-bootargs.patch
+sheng-gpu-app-cryptex-view.patch
 
