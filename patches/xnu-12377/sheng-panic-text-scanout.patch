@@ -3,7 +3,7 @@ Subject: [PATCH] sheng: boot-gated panic text on retained linear scanout
 
 Ported from Pad 8 Pro (0073-panic-text.patch), adapted for sheng's 3048x2032 scanout
 (dynamic scale = 4 for >=2560x1600, 5 for >=3200x2000) and UniXNU's #if defined(__arm64__).
-Requires piano-panic-text=1 boot argument; draws before panic-hold / reset.
+Requires piano-panic-text=1 boot argument; draws at kdp_machine_reboot_type / panic-hold.
 
 ---
 diff --git a/osfmk/console/Makefile b/osfmk/console/Makefile
@@ -142,12 +142,12 @@ index 0000000..e82f9e0
 +}
 +#endif
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
-index 648cb70..d5f457d 100644
+index 15b5964..a9b9a34 100644
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
-@@ -2773,6 +2773,41 @@ gc_pause( boolean_t pause, boolean_t graphics_now )
- 			thread_call_enter_delayed(&vc_progressmeter_call, vc_progressmeter_deadline);
- 		} else
+@@ -3310,3 +3310,38 @@ vc_set_progressmeter(int new_value)
+ }
+ 
  #endif /* defined(XNU_TARGET_OS_OSX) */
 +
 +#if defined(__arm64__)
@@ -179,16 +179,13 @@ index 648cb70..d5f457d 100644
 +	unsigned n = __atomic_load_n(&piano_text.used, __ATOMIC_RELAXED);
 +	if (n > PPT_BYTES) n = PPT_BYTES;
 +	ppt_select(&piano_page, piano_text.text, n);
-+	(void)ppt_render((volatile uint32_t *)vinfo.v_baseaddr, vinfo.v_width,
-+	    vinfo.v_height, vinfo.v_rowbytes, vinfo.v_depth, iso_font, &piano_page);
++	(void)ppt_render((volatile uint32_t *)vinfo.v_baseaddr, (unsigned)vinfo.v_width,
++	    (unsigned)vinfo.v_height, (unsigned)vinfo.v_rowbytes, (unsigned)vinfo.v_depth, iso_font, &piano_page);
 +	__builtin_arm_dsb(0xf);
 +}
 +#endif
- 		thread_call_enter_delayed(&vc_progress_call, vc_progress_deadline);
- 	}
- 
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index 4ce927a..0958775 100644
+index 6d38c56..04ac053 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
 @@ -1,3 +1,6 @@
@@ -198,17 +195,17 @@ index 4ce927a..0958775 100644
  /*
   * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
   *
-@@ -837,6 +840,9 @@ check_and_handle_nested_panic(uint64_t panic_options_mask, unsigned long panic_c
+@@ -1254,6 +1257,9 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
  #pragma clang diagnostic pop
  	extern void boot_log_panic_record(const char *, va_list *, unsigned long) __attribute__((weak_import));
  	if (&boot_log_panic_record) boot_log_panic_record(panic_format_str, panic_args, panic_caller);
 +#if defined(__arm64__)
 +	piano_panic_text_begin();
 +#endif
- 			printf("\n<end nested panic string>\n");
- 		}
- 	}
-@@ -1357,6 +1363,11 @@ panic_stackshot_release_lock(void)
+ 
+ 
+ #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)
+@@ -1393,6 +1399,11 @@ panic_stackshot_release_lock(void)
  static void
  kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
  {

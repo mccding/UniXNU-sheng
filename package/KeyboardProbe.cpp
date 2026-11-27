@@ -449,7 +449,10 @@ bool applyInputState() {
     ok = control(WN8030_CMD_INDICATOR, WN8030_LED_MIC_OFF) && ok;
     const uint32_t bl = kb->kbdBacklight.level();
     if (bl <= WN8030_BACKLIGHT_MAX) {
-        ok = control(WN8030_CMD_BACKLIGHT, on ? static_cast<uint8_t>(bl) : 0) && ok;
+        const uint8_t target = on ? static_cast<uint8_t>(bl) : 0;
+        const bool blOk = control(WN8030_CMD_BACKLIGHT, target);
+        if (blOk) IOLog("sheng keyboard: backlight -> %u\n", (unsigned)target);
+        ok = blOk && ok;
     }
     return ok;
 }
@@ -884,6 +887,7 @@ extern "C" void sheng_keyboard_probe(void) {
     kb->gesturesEnabled = gestures != 0;
     kb->fnRowEnabled = fnrow == 1;
     kb->keys.fnRow = kb->fnRowEnabled;
+    kb->pollPlan.configure(pianokeyboard::PollConfig());
     kb->kbdBacklight.configure(kb->backlightLevel, kb->backlightIdleMs);
     gKb = kb;
     thread_t thread = nullptr;

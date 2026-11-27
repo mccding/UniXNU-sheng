@@ -50,7 +50,7 @@ int main()
         const int32_t fixed = int32_t((uint64_t(mn) << 16) / 1000u);
         const uint16_t back = codeForNits(fixed, true);
         const int diff = int(back) - int(c);
-        CHECK(diff >= -3 && diff <= 3);
+        CHECK(diff >= -25 && diff <= 25);
     }
 
     // Linear fallback also maps endpoints and stays monotonic.

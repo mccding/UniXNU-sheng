@@ -37,10 +37,10 @@ index 7c37792..80ed1a3 100644
 +		return ENOMEM;
 +	}
 +	if (cmd_len) {
-+		strlcpy(buf, cmd, cap);
-+		strlcat(buf, " ", cap);
++		snprintf(buf, cap, "%s %s", cmd, builtin);
++	} else {
++		strlcpy(buf, builtin, cap);
 +	}
-+	strlcat(buf, builtin, cap);
 +	int err = sysctl_io_string(req, buf, 0, 0, NULL);
 +	kfree_data(buf, cap);
 +	return err;

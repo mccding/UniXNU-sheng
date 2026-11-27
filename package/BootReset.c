@@ -36,6 +36,7 @@ static uint64_t psci(uint64_t fid, uint64_t a1) {
 
 #if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
 extern void piano_panic_text_draw(void) __attribute__((weak_import));
+void boot_reset_watchdog_ping(void);
 static int platform_off_available, platform_reset_available;
 static uint32_t platform_panic_hold_ms;
 static int platform_power_invoke(uint32_t fid) {

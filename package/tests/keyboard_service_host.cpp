@@ -60,9 +60,10 @@ int main() {
     CHECK(s.deadline(io.clock, io.edges, io.irqHigh()) <= backoffAt);
     s.step(io);
     CHECK(io.reads == 1);   // respects 50 ms backoff, no spin!
-    io.clock = backoffAt; io.readResult = KeyboardRead::Valid; io.lineHigh = false;
+    io.clock = backoffAt; io.readResult = KeyboardRead::Valid;
     s.step(io);
-    CHECK(io.reads == 2 && !s.highBackoffDue && io.activities > 0);   // recovers automatically without edge!
+    CHECK(io.reads == 1 + KeyboardService::drainBudget && !s.highBackoffDue && io.activities > 0);   // recovers automatically without edge!
+    io.lineHigh = false;
 
     // Failed read does not consume its edge; retry without any new interrupt succeeds.
     io.edges = 3; io.readResult = KeyboardRead::Error; io.reads = 0;
@@ -75,7 +76,7 @@ int main() {
     CHECK(s.deadline(io.clock, io.edges) > io.clock);
 
     // Input flood yields after drainBudget, and due power command still runs.
-    io.flood = true; ++io.edges; io.clock = s.keepalive; io.pollDue = io.clock;
+    io.flood = true; ++io.edges; io.clock = s.keepalive; s.pollDue = io.clock;
     const unsigned before = io.reads; s.step(io);
     CHECK(io.reads == before + KeyboardService::drainBudget && io.powers == 1);
     CHECK(s.deadline(io.clock, io.edges) == io.clock);
