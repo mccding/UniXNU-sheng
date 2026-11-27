@@ -82,16 +82,22 @@ const ShengChargeCrypto kChargeCrypto = {chargeRandom, chargeHmac};
 }
 
 #if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
-// powerd 27.3 matches AppleSmartBatteryPack (ID=0) and AppleSmartBattery for macOS battery health.
+// powerd 27.3 matches AppleSmartBatteryPack (ID=0), AppleSmartBatteryBank (ID=0) and AppleSmartBattery for macOS battery health.
 class AppleSmartBatteryPack : public IOService {
     OSDeclareDefaultStructors(AppleSmartBatteryPack)
 };
 OSDefineMetaClassAndStructors(AppleSmartBatteryPack, IOService)
 
+class AppleSmartBatteryBank : public IOService {
+    OSDeclareDefaultStructors(AppleSmartBatteryBank)
+};
+OSDefineMetaClassAndStructors(AppleSmartBatteryBank, IOService)
+
 class AppleSmartBattery : public IOPMPowerSource {
     OSDeclareDefaultStructors(AppleSmartBattery)
     using Self = AppleSmartBattery;
     AppleSmartBatteryPack *healthPack = nullptr;
+    AppleSmartBatteryBank *healthBank = nullptr;
 #else
 class ShengBattery : public IOPMPowerSource {
     OSDeclareDefaultStructors(ShengBattery)
@@ -259,8 +265,26 @@ class ShengBattery : public IOPMPowerSource {
             OSSafeReleaseNULL(flags);
         }
         ok = ok && pack->setProperty("BatteryData", data);
+        const bool isNewBank = healthBank == nullptr;
+        AppleSmartBatteryBank *bank = healthBank;
+        if (ok && !bank) {
+            bank = OSTypeAlloc(AppleSmartBatteryBank);
+            if (!bank || !bank->init() || !bank->attach(pack)) {
+                OSSafeReleaseNULL(bank);
+                ok = false;
+            } else {
+                OSNumber *bankId = OSNumber::withNumber(0ULL, 32);
+                ok = bankId && bank->setProperty("ID", bankId);
+                OSSafeReleaseNULL(bankId);
+            }
+        }
+        ok = ok && bank->setProperty("BatteryData", data);
         data->release();
         if (!ok) {
+            if (isNewBank && bank) {
+                bank->detach(pack);
+                bank->release();
+            }
             if (isNew) {
                 pack->detach(this);
                 pack->release();
@@ -270,6 +294,10 @@ class ShengBattery : public IOPMPowerSource {
         if (isNew) {
             healthPack = pack;
             pack->registerService();
+        }
+        if (isNewBank) {
+            healthBank = bank;
+            bank->registerService();
         }
     }
 #endif

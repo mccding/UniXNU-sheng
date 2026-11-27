@@ -67,12 +67,36 @@ struct native_cpufreq_rec *native_cpufreq_ring;
 volatile uint32_t native_cpufreq_count;
 extern volatile uint32_t native_adreno_method_stats[20][4] __attribute__((weak_import));
 extern volatile uint32_t native_hid_input_events[8] __attribute__((weak_import));
+extern volatile int32_t native_buttons_stats[10] __attribute__((weak_import));
+extern volatile int32_t native_keyboard_hid_stats[6] __attribute__((weak_import));
 uint64_t sheng_cpu_idle_mach(int cpu);
 }
 static_assert(sizeof(native_cpufreq_rec) == 32, "cpufreq record");
 enum {kCpuFreqRing = 32768};   // BootDiagExport.c CpuFreqRing
 
 namespace {
+struct InputCounters {
+    uint32_t touches = &native_hid_input_events ? native_hid_input_events[6] : 0;
+    int32_t buttons = &native_buttons_stats ? native_buttons_stats[2] : 0;
+    int32_t keys = &native_keyboard_hid_stats ? native_keyboard_hid_stats[1] : 0;
+};
+
+bool pollInputActivity(InputCounters &c) {
+    bool active = false;
+    if (&native_hid_input_events && native_hid_input_events[6] != c.touches) {
+        c.touches = native_hid_input_events[6];
+        active = true;
+    }
+    if (&native_buttons_stats && native_buttons_stats[2] != c.buttons) {
+        c.buttons = native_buttons_stats[2];
+        active = true;
+    }
+    if (&native_keyboard_hid_stats && native_keyboard_hid_stats[1] != c.keys) {
+        c.keys = native_keyboard_hid_stats[1];
+        active = true;
+    }
+    return active;
+}
 constexpr uint64_t kDomainBase[3] = {0x17d91000, 0x17d92000, 0x17d93000};
 constexpr unsigned kDomainCpus[3] = {3, 4, 1};
 constexpr uint64_t kL3Base = 0x17d90000;
@@ -221,7 +245,7 @@ void governorThread(void *, wait_result_t) {
     bool ready[3] = {};
     uint64_t boostAbs = 0, boostEnd = 0;
     nanoseconds_to_absolutetime((uint64_t)gBoostMs * 1000000, &boostAbs);
-    uint32_t touches = &native_hid_input_events ? native_hid_input_events[6] : 0;
+    InputCounters inputs;
     uint64_t frameAbs = 0, frameEnd = 0;
     nanoseconds_to_absolutetime((uint64_t)gFrameMs * 1000000, &frameAbs);
     uint32_t submits = &native_adreno_method_stats ? native_adreno_method_stats[5][0] : 0, recent = 0;
@@ -234,8 +258,7 @@ void governorThread(void *, wait_result_t) {
         const uint64_t t = mach_absolute_time(), dt = t - lastT;
         lastT = t;
         if (!dt) continue;
-        if (boostAbs && &native_hid_input_events && native_hid_input_events[6] != touches) {
-            touches = native_hid_input_events[6];
+        if (boostAbs && pollInputActivity(inputs)) {
             if (t >= boostEnd) native_cpufreq_boosts = native_cpufreq_boosts + 1;
             boostEnd = t + boostAbs;
         }

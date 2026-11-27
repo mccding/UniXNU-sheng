@@ -199,7 +199,6 @@ jobs:
           for name in (
               'turnip-darwin-idle-trim-reclaim.patch',
               'turnip-darwin-cs-reserve.patch',
-              'turnip-darwin-sysmem-feedback-flush.patch',
           ):
               src_text = (Path('device/patches/adreno-mesa') / name).read_text().replace('\r\n', '\n')
               (mesa_dir / name).write_text(src_text, newline='\n')
