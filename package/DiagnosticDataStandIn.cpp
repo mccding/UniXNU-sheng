@@ -20,14 +20,24 @@ public:
 OSDefineMetaClassAndStructors(AppleDiagnosticDataAccessReadOnly, AppleDiagnosticDataAccess)
 
 namespace {
-constexpr unsigned char kErased[24] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                                       0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+#define DIAG_CONST __attribute__((section("__DATA_CONST,__const")))
+#else
+#define DIAG_CONST
+#endif
+static const unsigned char kErased[24] DIAG_CONST = {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+};
+static const char kDiagKey[] DIAG_CONST = "AppleDiagnosticDataSysCfg";
+static const char kDiagLogOk[] DIAG_CONST = "DiagnosticDataStandIn: AppleDiagnosticDataAccessReadOnly registered (AppleDiagnosticDataSysCfg %u bytes, erased)\n";
+static const char kDiagLogNoProp[] DIAG_CONST = "DiagnosticDataStandIn: AppleDiagnosticDataAccessReadOnly registered without AppleDiagnosticDataSysCfg\n";
 }
 
 bool AppleDiagnosticDataAccessReadOnly::start(IOService *provider)
 {
     if (!AppleDiagnosticDataAccess::start(provider)) return false;
-    const OSSymbol *key = OSSymbol::withCStringNoCopy("AppleDiagnosticDataSysCfg");
+    const OSSymbol *key = OSSymbol::withCStringNoCopy(kDiagKey);
     OSData *erased = key ? OSData::withBytes(kErased, sizeof kErased) : nullptr;
     bool published = false;
     if (erased) {
@@ -37,10 +47,9 @@ bool AppleDiagnosticDataAccessReadOnly::start(IOService *provider)
     if (key) key->release();
     registerService();
     if (published) {
-        IOLog("DiagnosticDataStandIn: AppleDiagnosticDataAccessReadOnly registered (AppleDiagnosticDataSysCfg %u bytes, erased)\n",
-              (unsigned)sizeof kErased);
+        IOLog(kDiagLogOk, (unsigned)sizeof kErased);
     } else {
-        IOLog("DiagnosticDataStandIn: AppleDiagnosticDataAccessReadOnly registered without AppleDiagnosticDataSysCfg\n");
+        IOLog(kDiagLogNoProp);
     }
     return true;
 }

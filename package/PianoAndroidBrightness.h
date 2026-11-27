@@ -14,7 +14,12 @@ enum {
 
 /* Piano SDR requests observed on Android. Each pair is panel DBV and KTZ8866 code.
  * The off pair is retained as evidence; lit targets use the interval 8..2047. */
-static const uint16_t pa_sdr_points[][2] = {
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+#define PA_SDR_CONST __attribute__((section("__DATA_CONST,__const")))
+#else
+#define PA_SDR_CONST
+#endif
+static const uint16_t pa_sdr_points[][2] PA_SDR_CONST = {
     {0, 0}, {8, 178}, {9, 190}, {10, 220}, {11, 250}, {12, 250}, {13, 286},
     {14, 318}, {15, 347}, {16, 347}, {17, 374}, {18, 399}, {19, 422}, {20, 422},
     {21, 444}, {22, 464}, {23, 483}, {24, 483}, {25, 501}, {26, 518}, {27, 534},
@@ -104,6 +109,7 @@ static const uint16_t pa_sdr_points[][2] = {
     {2003, 1945}, {2007, 1946}, {2015, 1947}, {2017, 1947}, {2023, 1948}, {2027, 1949}, {2031, 1950},
     {2038, 1951}, {2041, 1951}, {2045, 1952}, {2047, 1952},
 };
+#undef PA_SDR_CONST
 
 static inline uint16_t pa_sdr_code_at_dbv(uint16_t dbv)
 {

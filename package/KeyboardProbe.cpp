@@ -68,6 +68,7 @@ static const char kKeepAwakeFailureLog[] KEYBOARD_CONST = "sheng keyboard: keep-
 static const char kControllerReloadLog[] KEYBOARD_CONST = "sheng keyboard: controller reload %u (read failures %u, command failures %u, i2c failures %d, last i2c error 0x%x, "
               "frames %d)\n";
 static const char kControllerReloadResultLog[] KEYBOARD_CONST = "sheng keyboard: controller reload %u %s (stage %d, detail %d)\n";
+static const char kBacklightLog[] KEYBOARD_CONST = "sheng keyboard: backlight -> %u\n";
 #undef KEYBOARD_CONST
 
 constexpr uint64_t kGcc = 0x00100000ULL, kTlmm = 0x0f100000ULL, kSe = 0x00884000ULL, kRsc = 0x17a20000ULL, kCmdDb = 0x81c60000ULL;
@@ -227,7 +228,7 @@ void applyBacklight(int level) {
     Keyboard *kb = gKb;
     if (level < 0 || !kb->attached || !kb->inputEnabled) return;
     if (control(WN8030_CMD_BACKLIGHT, static_cast<uint8_t>(level))) {
-        IOLog("sheng keyboard: backlight -> %d\n", level);
+        IOLog(kBacklightLog, (unsigned)level);
     }
 }
 
@@ -451,7 +452,7 @@ bool applyInputState() {
     if (bl <= WN8030_BACKLIGHT_MAX) {
         const uint8_t target = on ? static_cast<uint8_t>(bl) : 0;
         const bool blOk = control(WN8030_CMD_BACKLIGHT, target);
-        if (blOk) IOLog("sheng keyboard: backlight -> %u\n", (unsigned)target);
+        if (blOk) IOLog(kBacklightLog, (unsigned)target);
         ok = blOk && ok;
     }
     return ok;

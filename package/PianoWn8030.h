@@ -21,7 +21,11 @@ inline void putLe16(uint8_t *p, uint32_t v) { p[0] = uint8_t(v); p[1] = uint8_t(
 
 inline unsigned gapBucket(uint32_t ms)
 {
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+    static const uint32_t below[kGapBuckets - 1] __attribute__((section("__DATA_CONST,__const"))) = {10, 20, 30, 45, 60, 100, 250};
+#else
     static const uint32_t below[kGapBuckets - 1] = {10, 20, 30, 45, 60, 100, 250};
+#endif
     unsigned bucket = 0;
     while (bucket < kGapBuckets - 1 && ms >= below[bucket]) ++bucket;
     return bucket;
@@ -138,6 +142,7 @@ struct PointerConfig {
 };
 
 enum class Swipe : uint8_t { none, up, down, left, right };
+#if !defined(KERNEL)
 inline const char *swipeName(Swipe s)
 {
     switch (s) {
@@ -149,6 +154,7 @@ inline const char *swipeName(Swipe s)
     }
     return "?";
 }
+#endif
 inline uint8_t swipeUsage(Swipe s)
 {
     switch (s) {

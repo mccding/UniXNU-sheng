@@ -45,7 +45,21 @@ constexpr uint32_t kSpi[2] = {354, 466};
 constexpr uint32_t kGccVote = 0x52008;
 // gcc-sm8550.c: wrap1 core_2x 18, core 19, m_ahb 20, s_ahb 21, s1 23; i2c hub s_ahb 7, core 8, s2 12.
 constexpr uint32_t kVoteBits = (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 23) | (1u << 7) | (1u << 8) | (1u << 12);
-constexpr uint32_t kHalt[] = {0x23294, 0x23284, 0x2327c, 0x23280, 0x1813c, 0x23140, 0x23144, 0x1703c};
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+#define BACKLIGHT_CONST __attribute__((section("__DATA_CONST,__const")))
+#else
+#define BACKLIGHT_CONST
+#endif
+static const uint32_t kHalt[] BACKLIGHT_CONST = {0x23294, 0x23284, 0x2327c, 0x23280, 0x1813c, 0x23140, 0x23144, 0x1703c};
+static const char kLogSurvey[] BACKLIGHT_CONST = "sheng backlight: survey a(id=0x%02x cfg1=0x%02x en=0x%02x code=%d) b(id=0x%02x cfg1=0x%02x en=0x%02x code=%d) mode=%s initial=%u\n";
+static const char kLogSetProps[] BACKLIGHT_CONST = "sheng backlight: %s -> level %u (%llu ms)\n";
+static const char kLogWakeDone[] BACKLIGHT_CONST = "sheng backlight: panel back to its level %llu ms after the wake, %u frames shown%s\n";
+static const char kLogLid[] BACKLIGHT_CONST = "sheng backlight: lid %s, panel %s\n";
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+static const char kLogSleep[] BACKLIGHT_CONST = "sheng backlight: system going to sleep, panel dark\n";
+static const char kLogAwake[] BACKLIGHT_CONST = "sheng backlight: system awake, panel waits for the display\n";
+static const char kLogNoSleep[] BACKLIGHT_CONST = "sheng backlight: no sleep/wake interest\n";
+#endif
 constexpr uint8_t kAddress = shengbacklight::kAddress;
 constexpr uint32_t kMinNits = shengbacklight::kMinNits, kMidNits = shengbacklight::kMidNits, kMaxNits = shengbacklight::kMaxNits;
 constexpr uint32_t kFloorCode = shengbacklight::kFloorCode, kMaxLevel = shengbacklight::kFullScale;
@@ -334,7 +348,7 @@ class ShengBacklight : public IOService {
         if (!lid_backlight_wake_ready(counted, gWakeFrames, frames, ms)) {sender->setTimeoutMS(20); return;}
         __atomic_store_n(&gWaking, 0u, __ATOMIC_RELEASE);
         __atomic_store_n(&gSystemAsleep, 0u, __ATOMIC_RELEASE);
-        IOLog("sheng backlight: panel back to its level %llu ms after the wake, %u frames shown%s\n", ms, frames - gWakeFrames,
+        IOLog(kLogWakeDone, ms, frames - gWakeFrames,
               counted ? "" : " (no frame count)");
         if (self->published) self->setLevel(self->level);
     }
@@ -358,7 +372,7 @@ class ShengBacklight : public IOService {
         if (message == kIOMessageSystemWillSleep) {
             __atomic_store_n(&gWaking, 0u, __ATOMIC_RELEASE);
             __atomic_store_n(&gSystemAsleep, 1u, __ATOMIC_RELEASE);
-            IOLog("sheng backlight: system going to sleep, panel dark\n");
+            IOLog(kLogSleep);
             if (IOTimerEventSource *timer = gLidTimer) timer->setTimeoutUS(1);
             return kIOReturnSuccess;
         }
@@ -366,7 +380,7 @@ class ShengBacklight : public IOService {
         gWakeFrames = shownFrames(counted);
         gWakeAt = now();
         __atomic_store_n(&gWaking, 1u, __ATOMIC_RELEASE);
-        IOLog("sheng backlight: system awake, panel waits for the display\n");
+        IOLog(kLogAwake);
         if (IOTimerEventSource *timer = gWakeTimer) timer->setTimeoutMS(20);
         else {__atomic_store_n(&gWaking, 0u, __ATOMIC_RELEASE); __atomic_store_n(&gSystemAsleep, 0u, __ATOMIC_RELEASE);
               if (IOTimerEventSource *lidTimer = gLidTimer) lidTimer->setTimeoutUS(1);}
@@ -502,7 +516,7 @@ class ShengBacklight : public IOService {
         const uint32_t initial = read > 0 ? clampLit((uint32_t)read) : shengbacklight::codeForNits(shengbacklight::kMidFixed, exponential);
         level = to = targetCode = initial;
         targetDark = false;
-        IOLog("sheng backlight: survey a(id=0x%02x cfg1=0x%02x en=0x%02x code=%d) b(id=0x%02x cfg1=0x%02x en=0x%02x code=%d) mode=%s initial=%u\n",
+        IOLog(kLogSurvey,
               a.id, a.cfg1, a.foundEn, native_backlight_stats[3],
               b.id, b.cfg1, b.foundEn, native_backlight_stats[4],
               exponential ? "exponential" : "linear", initial);
@@ -543,7 +557,7 @@ public:
         gLidTimer = lid;
         gWakeTimer = wake;
 #if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
-        if (!registerSleepWakeInterest(&sleepWake, nullptr, nullptr)) IOLog("sheng backlight: no sleep/wake interest\n");
+        if (!registerSleepWakeInterest(&sleepWake, nullptr, nullptr)) IOLog(kLogNoSleep);
 #endif
         for (unsigned i = 0; i < 2; ++i) {
             const GeniIo io = {ioRead, ioWrite, (void *)gSe[i].va};
@@ -617,7 +631,7 @@ public:
             return kIOReturnSuccess;
         }
         const uint32_t logged = __atomic_fetch_add(&gSetPropsLogCount, 1u, __ATOMIC_RELAXED);
-        if (logged < 8) IOLog("sheng backlight: %s -> level %u (%llu ms)\n", source, goal, (unsigned long long)milliseconds);
+        if (logged < 8) IOLog(kLogSetProps, source, goal, (unsigned long long)milliseconds);
         queueLevel(goal, (uint32_t)milliseconds);
         return kIOReturnSuccess;
     }
@@ -640,7 +654,7 @@ OSDefineMetaClassAndStructors(ShengBacklight, IOService)
 
 extern "C" void sheng_backlight_lid(bool closed) {
     __atomic_store_n(&gLidClosed, closed ? 1u : 0u, __ATOMIC_RELEASE);
-    IOLog("sheng backlight: lid %s, panel %s\n", closed ? "closed" : "open", closed ? "dark" : "back to its level");
+    IOLog(kLogLid, closed ? "closed" : "open", closed ? "dark" : "back to its level");
     if (IOTimerEventSource *timer = gLidTimer) timer->setTimeoutUS(1);
 }
 

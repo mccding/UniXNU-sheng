@@ -15,10 +15,20 @@ extern "C" volatile int sheng_software_aes_state = 0;
 
 namespace {
 
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+#define AES_PROBE_CONST __attribute__((section("__DATA_CONST,__const")))
+#else
+#define AES_PROBE_CONST
+#endif
+static const char kAesFailLog[] AES_PROBE_CONST = "SoftwareAES: not started (%d)\n";
+static const char kAesOkLog[] AES_PROBE_CONST = "SoftwareAES: IOAESAccelerator registered\n";
+static const char kDiagPostFailLog[] AES_PROBE_CONST = "DiagnosticDataStandIn: postModLoad failed\n";
+static const char kDiagSkipLog[] AES_PROBE_CONST = "DiagnosticDataStandIn: start skipped\n";
+
 void fail(int step)
 {
     sheng_software_aes_state = -step;
-    IOLog("SoftwareAES: not started (%d)\n", -step);
+    IOLog(kAesFailLog, -step);
     thread_terminate(current_thread());
 }
 
@@ -29,7 +39,7 @@ void registerDiagnosticStandIn(IOService *parent)
     if (!diagHandle) return;
     diagnostic_data_static_init();
     if (OSMetaClass::postModLoad(diagHandle)) {
-        IOLog("DiagnosticDataStandIn: postModLoad failed\n");
+        IOLog(kDiagPostFailLog);
         return;
     }
     OSObject *obj = OSMetaClass::allocClassWithName("AppleDiagnosticDataAccessReadOnly");
@@ -37,7 +47,7 @@ void registerDiagnosticStandIn(IOService *parent)
     const bool attached = diag && diag->init() && diag->attach(parent);
     if (!attached || !diag->start(parent)) {
         if (attached) diag->detach(parent);
-        IOLog("DiagnosticDataStandIn: start skipped\n");
+        IOLog(kDiagSkipLog);
     }
     OSSafeReleaseNULL(obj);
 }
@@ -58,7 +68,7 @@ void worker(void *, wait_result_t)
     if (!aes->start(parent)) {aes->detach(parent); aes->release(); fail(6);}
     aes->release();
     sheng_software_aes_state = 1;
-    IOLog("SoftwareAES: IOAESAccelerator registered\n");
+    IOLog(kAesOkLog);
     registerDiagnosticStandIn(parent);
     thread_terminate(current_thread());
 }
