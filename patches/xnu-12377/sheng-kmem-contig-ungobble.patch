@@ -1,0 +1,48 @@
+From: xiaomi-sheng Stage 2 <sheng@unixnu.local>
+Subject: [PATCH] vm_kern: ungobble pages freed on failed contiguous kmem allocations
+
+kmem_alloc_contig_guard() obtains gobbled, already wire-counted pages from
+cpm_allocate(). When kmem_alloc_guard_internal() fails before
+kernel_memory_populate_object_and_unlock(), out_error frees wired_page_list
+via vm_page_free_list(..., FALSE) while leaving vmp_gobbled set and
+vm_page_gobble_count / vm_page_wire_count elevated. Later IOPL wiring of
+such a page triggers assert(!mem->vmp_gobbled) in vm_page_unwire().
+Clear vmp_gobbled and decrement both counts before freeing on error.
+
+diff --git a/osfmk/vm/vm_kern.c b/osfmk/vm/vm_kern.c
+--- a/osfmk/vm/vm_kern.c
++++ b/osfmk/vm/vm_kern.c
+@@ -833,6 +833,25 @@ kmem_find_space(
+ 	return KERN_SUCCESS;
+ }
+ 
++static void
++kmem_ungobble_page_list(vm_page_t page_list)
++{
++	unsigned int gobbled = 0;
++
++	for (vm_page_t mem = page_list; mem != VM_PAGE_NULL; mem = mem->vmp_snext) {
++		if (mem->vmp_gobbled) {
++			mem->vmp_gobbled = false;
++			gobbled++;
++		}
++	}
++	if (gobbled) {
++		vm_page_lockspin_queues();
++		vm_page_gobble_count -= gobbled;
++		vm_page_wire_count -= gobbled;
++		vm_page_unlock_queues();
++	}
++}
++
+ static kmem_return_t
+ kmem_alloc_guard_internal(
+ 	vm_map_t                map,
+@@ -1183,6 +1202,7 @@ out_error:
+ 		wired_page_list = guard_right;
+ 	}
+ 	if (wired_page_list) {
++		kmem_ungobble_page_list(wired_page_list);
+ 		vm_page_free_list(wired_page_list, FALSE);
+ 	}
+ 

@@ -1,0 +1,12 @@
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index ee72363..93cfabe 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -271,6 +271,7 @@ static id clientDevice(unsigned port) {
+             lastError = "exception";
+         }
+         if (!device && !lastError[0]) lastError = nmb_last_error();
++        unsetenv("METAL2VULKAN_SHADER_CACHE_OPTIONAL");
+     }
+     if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
+     // The client's first problem, once, on the same text line, sent from the thread that hit it: WidgetRenderer crashed on a nil render

@@ -101,15 +101,17 @@ jobs:
             UniXNU/out/feeds
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/gpu-reference
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/mesa-work
+            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/unixnu-mesa-patch.sha256
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/adreno-metal-bridge
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/m2v-target
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/mesa-tu-macos27
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime/data.dbr
             device/drivers/Ath12kWifi/deps
             device/.cache/firmware
-      - name: Apply Stage 1 12G RAM and GPU memory patches
+      - name: Apply Stage 1 and Stage 2 patches
         run: |
           python3 - <<'PY'
+          import json, shutil, subprocess
           from pathlib import Path
 
           mm = Path('uefi-sheng/Platforms/Xiaomi/shengPkg/Library/MemoryMapLib/MemoryMapLib.c')
@@ -177,7 +179,27 @@ jobs:
               assert close != -1, 'PATCHES closing bracket not found in build-adreno-metal-bridge.py'
               br_src = br_src[:close] + "\n    '0001-metal2vulkan-4mib-unit-blocks.patch'," + br_src[close:]
           bridge.write_text(br_src)
-          print('Applied Stage 1 UEFI/DarwinBoot/UniXNU/metal2vulkan patches.')
+
+          am_dir = Path('UniXNU/drivers/AdrenoMetal')
+          air_src = Path('device/patches/adreno-metal/AirSignature.h').read_text().replace('\r\n', '\n')
+          (am_dir / 'AirSignature.h').write_text(air_src, newline='\n')
+          for patch in sorted(Path('device/patches/adreno-metal').glob('*.patch')):
+              subprocess.run(['git', '-C', str(am_dir), 'apply', str(patch.resolve())], check=True)
+
+          mesa_dir = Path('UniXNU/patches/mesa')
+          pins_path = Path('UniXNU/scripts/data/adreno-compiler-inputs.json')
+          pins = json.loads(pins_path.read_text())
+          for name in (
+              'turnip-darwin-idle-trim-reclaim.patch',
+              'turnip-darwin-cs-reserve.patch',
+          ):
+              src_text = (Path('device/patches/mesa') / name).read_text().replace('\r\n', '\n')
+              (mesa_dir / name).write_text(src_text, newline='\n')
+              rel = f'patches/mesa/{name}'
+              if rel not in pins['patches']:
+                  pins['patches'].append(rel)
+          pins_path.write_text(json.dumps(pins, indent=2) + '\n')
+          print('Applied Stage 1 and Stage 2 patches.')
           PY
       - name: Refresh pinned translator checkout
         run: |
@@ -193,6 +215,35 @@ jobs:
               actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
               if actual != pin or not stamp.exists() or stamp.read_text().strip() != signature:
                   shutil.rmtree(source)
+          stamp.parent.mkdir(parents=True, exist_ok=True)
+          stamp.write_text(signature + '\n')
+          PYTHON
+      - name: Refresh pinned Mesa checkout
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, shutil, subprocess
+          from pathlib import Path
+          core = Path('UniXNU')
+          pins_path = core / 'scripts/data/adreno-compiler-inputs.json'
+          pins = json.loads(pins_path.read_text())
+          pin = pins['mesa']['commit']
+          tree = core / 'out/sheng/macos-27.3-26C5035r/sheng_macos/tree'
+          source = tree / '.cache/mesa-work'
+          build_dir = tree / 'build/mesa-tu-macos27'
+          h = hashlib.sha256((pin + '\n').encode())
+          h.update(pins_path.read_bytes())
+          h.update((core / 'scripts/build-turnip-darwin.py').read_bytes())
+          for rel in pins['patches']:
+              h.update(rel.encode() + b'\n')
+              h.update((core / rel).read_bytes())
+          signature = h.hexdigest()
+          stamp = tree / '.cache/unixnu-mesa-patch.sha256'
+          if source.exists():
+              actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+              if actual != pin or not stamp.exists() or stamp.read_text().strip() != signature:
+                  shutil.rmtree(source)
+                  if build_dir.exists():
+                      shutil.rmtree(build_dir)
           stamp.parent.mkdir(parents=True, exist_ok=True)
           stamp.write_text(signature + '\n')
           PYTHON
@@ -316,6 +367,7 @@ jobs:
             UniXNU/out/feeds
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/gpu-reference
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/mesa-work
+            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/unixnu-mesa-patch.sha256
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/adreno-metal-bridge
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/m2v-target
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/mesa-tu-macos27

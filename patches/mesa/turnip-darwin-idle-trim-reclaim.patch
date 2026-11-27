@@ -1,0 +1,352 @@
+turnip: darwin, idle BO trim timer and cross-process reclaim on BoAlloc NoMemory
+
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index be9c50e..f51d4ba 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -16,6 +16,7 @@
+ #include <IOKit/IOKitLib.h>
+ #include <dispatch/dispatch.h>
+ #include <mach/mach.h>
++#include <notify.h>
+ 
+ #include "NativeAdrenoABI.h"
+ 
+@@ -76,14 +77,17 @@ struct darwin_retired_bo {
+  * (DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, warning or critical, the signal Apple's frameworks purge on) and when an allocation or a GPU range
+  * cannot be had (then the allocation is tried again). */
+ static volatile uint32_t darwin_memory_pressure;   /* bumped by the memory-pressure source; each device flushes once per change */
++#define DARWIN_RECLAIM_NOTIFICATION "org.unixnu.sheng.gpu-reclaim"
+ struct darwin_cached_bo {
+-   uint64_t handle, iova, size, stamp, freed_s;   /* freed_s: monotonic seconds when it entered the cache */
++   uint64_t handle, iova, size, stamp;
+    void *mapping;
+    uint32_t token;
+    bool read_only;
++   uint64_t cached_ns;   /* os_time_get_nano() when it entered the cache */
+ };
+ struct darwin_bo_cache_stats {
+    uint64_t lookups, hits, inserts, evictions, flushes, bytes_peak;
++   uint64_t aged, trims, reclaims_asked, reclaims_seen, retries, retry_wins;
+ };
+ 
+ /* The GPU address space as two red-black trees over the free holes (Mesa's rb_tree, the same algorithm as XNU's libkern/tree.h): by
+@@ -125,7 +129,7 @@ struct darwin_retire_state {
+    uint64_t enqueued, reaped, pressure_waits;
+    struct darwin_cached_bo *cache;
+    unsigned cache_count, cache_capacity;
+-   uint64_t cache_bytes, cache_stamp, cache_cleaned_s;
++   uint64_t cache_bytes, cache_stamp;
+    uint32_t pressure_seen;
+    struct darwin_bo_cache_stats cache_stats;
+    /* Timeline WAIT_ANY support (protected by dev->submit_mutex): avoids Mesa's busy-spin fallback
+@@ -140,6 +144,11 @@ struct darwin_retire_state {
+    pthread_t fence_watcher_thread;
+    pthread_cond_t fence_watcher_cond;
+    struct tu_device *fence_watcher_dev;
++   /* Idle trim one-shot timer (on its own serial queue; armed under `lock`) and its device. */
++   dispatch_queue_t trim_queue;
++   dispatch_source_t trim_timer;
++   bool trim_armed;
++   struct tu_device *dev;
+ };
+ static struct darwin_retire_state *darwin_stats_state;   /* for tu_darwin_bo_cache_stats */
+ 
+@@ -648,6 +657,9 @@ darwin_cache_log(struct darwin_retire_state *retire)
+            (unsigned long long)(st->hits * 1000 / st->lookups % 10), (unsigned long long)retire->cache_count,
+            (unsigned long long)(retire->cache_bytes >> 20), (unsigned long long)st->evictions, (unsigned long long)st->flushes,
+            (unsigned long long)darwin_va_holes());
++   fprintf(stderr, "NativeAdreno BO cache: %llu given back after age, %llu idle trims, %llu reclaims asked, %llu answered, %llu BoAlloc waits for memory, %llu made it\n",
++           (unsigned long long)st->aged, (unsigned long long)st->trims, (unsigned long long)st->reclaims_asked,
++           (unsigned long long)st->reclaims_seen, (unsigned long long)st->retries, (unsigned long long)st->retry_wins);
+ }
+ 
+ /* Drops the cache entry at the index for real. VK_NOT_READY keeps it. */
+@@ -676,8 +688,8 @@ darwin_cache_put(struct tu_device *dev, struct darwin_retire_state *retire, cons
+       retire->cache = cache;
+       retire->cache_capacity = capacity;
+    }
+-   retire->cache[retire->cache_count++] = {bo->handle, bo->iova, bo->size, ++retire->cache_stamp,
+-                                           (uint64_t)(os_time_get_nano() / 1000000000), bo->mapping, bo->token, bo->read_only};
++   retire->cache[retire->cache_count++] = {bo->handle, bo->iova, bo->size, ++retire->cache_stamp, bo->mapping, bo->token,
++                                           bo->read_only, os_time_get_nano()};
+    retire->cache_bytes += bo->size;
+    if (retire->cache_bytes > retire->cache_stats.bytes_peak)
+       retire->cache_stats.bytes_peak = retire->cache_bytes;
+@@ -722,10 +734,34 @@ darwin_cache_flush(struct tu_device *dev, struct darwin_retire_state *retire)
+    return any;
+ }
+ 
+-/* Called under retire->lock: once per memory-pressure notification the whole cache goes back, and otherwise every BO not reused
+- * within a second of entering it, as freedreno's own BO cache keeps a freed BO (freedreno_bo_cache.c, fd_bo_cache_cleanup: "keep things
+- * in cache for at least 1 second", at most once a second). Without the second rule the cache held every BO the render server ever freed
+- * once the kernel stopped refusing allocations (untagged-7c2c611f: backboardd held 3099 MiB, the system's memory ran out). */
++/* How long an unused cached BO stays before going back to the kernel (TU_DARWIN_BO_CACHE_AGE_MS, 2000 ms by default; 0: keep). */
++static uint64_t
++darwin_cache_age_ns(void)
++{
++   static uint64_t age = UINT64_MAX;
++   if (age == UINT64_MAX) {
++      const char *text = getenv("TU_DARWIN_BO_CACHE_AGE_MS");
++      age = (text && *text ? strtoull(text, NULL, 10) : 2000) * 1000000ull;
++   }
++   return age;
++}
++
++/* Called under retire->lock. Cached BOs older than the age go back to the kernel. */
++static void
++darwin_cache_age(struct tu_device *dev, struct darwin_retire_state *retire)
++{
++   const uint64_t age = darwin_cache_age_ns();
++   if (!age || !retire->cache_count)
++      return;
++   const uint64_t now = os_time_get_nano();
++   for (unsigned i = retire->cache_count; i-- > 0;) {
++      const struct darwin_cached_bo *e = &retire->cache[i];
++      if (now - e->cached_ns >= age && darwin_cache_evict(dev, retire, i) == VK_SUCCESS)
++         ++retire->cache_stats.aged;
++   }
++}
++
++/* Called under retire->lock: once per memory-pressure / reclaim notification the whole cache goes back, otherwise aged entries. */
+ static void
+ darwin_cache_trim(struct tu_device *dev, struct darwin_retire_state *retire)
+ {
+@@ -735,27 +771,94 @@ darwin_cache_trim(struct tu_device *dev, struct darwin_retire_state *retire)
+       darwin_cache_flush(dev, retire);
+       return;
+    }
+-   const uint64_t now = (uint64_t)(os_time_get_nano() / 1000000000);
+-   if (now == retire->cache_cleaned_s)
++   darwin_cache_age(dev, retire);
++}
++
++/* Called under retire->lock. Arms the one-shot idle trim timer while something is cached or waiting for its fence. */
++static void
++darwin_trim_arm(struct darwin_retire_state *retire)
++{
++   const uint64_t age = darwin_cache_age_ns();
++   if (!age || !retire->trim_timer || retire->trim_armed || (!retire->cache_count && !retire->count))
+       return;
+-   retire->cache_cleaned_s = now;
+-   for (unsigned i = retire->cache_count; i-- > 0;)
+-      if (now - retire->cache[i].freed_s > 1)
+-         darwin_cache_evict(dev, retire, i);
++   retire->trim_armed = true;
++   dispatch_source_set_timer(retire->trim_timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)age), DISPATCH_TIME_FOREVER,
++                             age / 2 < 1000000000ull ? age / 2 : 1000000000ull);
++}
++
++/* Active devices in this process, woken on cross-process gpu-reclaim or memory-pressure events. */
++static pthread_mutex_t darwin_devices_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct darwin_retire_state *darwin_devices[8];
++
++static void
++darwin_kick_devices(void)
++{
++   pthread_mutex_lock(&darwin_devices_lock);
++   for (unsigned i = 0; i < ARRAY_SIZE(darwin_devices); ++i) {
++      struct darwin_retire_state *retire = darwin_devices[i];
++      if (retire && retire->trim_timer)
++         dispatch_source_set_timer(retire->trim_timer, DISPATCH_TIME_NOW, DISPATCH_TIME_FOREVER, 0);
++   }
++   pthread_mutex_unlock(&darwin_devices_lock);
++}
++
++/* Ask every GPU process to release cached BOs (at most every 50 ms per process) when a BoAlloc fails with kIOReturnNoMemory. */
++static void
++darwin_ask_reclaim(struct darwin_retire_state *retire)
++{
++   static uint64_t last;
++   const uint64_t now = os_time_get_nano(), then = p_atomic_read(&last);
++   if (then && now - then < 50000000ull)
++      return;
++   p_atomic_set(&last, now);
++   pthread_mutex_lock(&retire->lock);
++   ++retire->cache_stats.reclaims_asked;
++   pthread_mutex_unlock(&retire->lock);
++   notify_post(DARWIN_RECLAIM_NOTIFICATION);
++}
++
++static VkResult darwin_reap_locked(struct tu_device *dev, struct darwin_retire_state *retire);
++
++/* Idle trim timer handler on its serial queue: reaps completed retired BOs and ages/flushes cached BOs, then re-arms if non-empty. */
++static void
++darwin_trim_fire(void *context)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)context;
++   pthread_mutex_lock(&retire->lock);
++   /* Hold trim_armed true across reap+trim so darwin_reap_locked does not arm a 2s timer before darwin_cache_trim empties it. */
++   retire->trim_armed = true;
++   ++retire->cache_stats.trims;
++   if (darwin_reap_locked(retire->dev, retire) == VK_SUCCESS) {
++      const uint32_t pressure = p_atomic_read(&darwin_memory_pressure);
++      if (pressure != retire->pressure_seen)
++         ++retire->cache_stats.reclaims_seen;
++      darwin_cache_trim(retire->dev, retire);
++      retire->trim_armed = false;
++      darwin_trim_arm(retire);
++   } else {
++      retire->trim_armed = false;
++   }
++   pthread_mutex_unlock(&retire->lock);
+ }
+ 
+-/* The process's memory-pressure source, made once: libdispatch delivers the kernel's memorystatus levels to it. */
++/* The process's memory-pressure source and cross-process reclaim listener, made once. */
+ static void
+ darwin_watch_memory_pressure(void)
+ {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, [] {
++      int token = 0;
++      notify_register_dispatch(DARWIN_RECLAIM_NOTIFICATION, &token, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^(int) {
++         p_atomic_inc(&darwin_memory_pressure);
++         darwin_kick_devices();
++      });
++      /* Include per-process limit warn/critical (0x10 | 0x20) in addition to system-wide pressure. */
+       dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+-                                                        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
++                                                        DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL | 0x10 | 0x20,
+                                                         dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+       if (!source)
+          return;
+-      dispatch_source_set_event_handler_f(source, [](void *) { p_atomic_inc(&darwin_memory_pressure); });
++      dispatch_source_set_event_handler_f(source, [](void *) { p_atomic_inc(&darwin_memory_pressure); darwin_kick_devices(); });
+       dispatch_activate(source);
+    });
+ }
+@@ -812,6 +915,7 @@ darwin_reap_locked(struct tu_device *dev, struct darwin_retire_state *retire)
+    for (unsigned i = kept; i < total; ++i)
+       retire->entries[(retire->head + i) % retire->capacity] = {};
+    retire->count = kept;
++   darwin_trim_arm(retire);
+    return VK_SUCCESS;
+ }
+ 
+@@ -832,6 +936,50 @@ darwin_collect_retired(struct tu_device *dev, bool opportunistic)
+    return result;
+ }
+ 
++/* Retry helper after BoAlloc returns kIOReturnNoMemory: broadcasts gpu-reclaim once and backs off 4, 8, 16, 32, 64 ms while reaping. */
++static uint64_t darwin_retry_failed_ns;
++static bool
++darwin_retry_wait(struct tu_device *dev, struct darwin_retire_state *retire, unsigned retries)
++{
++   if (retries >= 5)
++      return false;
++   if (!retries) {
++      const uint64_t failed = p_atomic_read(&darwin_retry_failed_ns);
++      if (failed && os_time_get_nano() - failed < 1000000000ull)
++         return false;
++      darwin_ask_reclaim(retire);
++   }
++   usleep(4000u << retries);
++   pthread_mutex_lock(&retire->lock);
++   ++retire->cache_stats.retries;
++   if (darwin_reap_locked(dev, retire) == VK_SUCCESS)
++      darwin_cache_trim(dev, retire);
++   pthread_mutex_unlock(&retire->lock);
++   return true;
++}
++
++static void
++darwin_retry_done(struct darwin_retire_state *retire, unsigned retries, bool made)
++{
++   if (!retries)
++      return;
++   static uint64_t outcomes[2];
++   p_atomic_set(&darwin_retry_failed_ns, made ? 0 : os_time_get_nano());
++   if (made) {
++      pthread_mutex_lock(&retire->lock);
++      ++retire->cache_stats.retry_wins;
++      pthread_mutex_unlock(&retire->lock);
++   }
++   const uint64_t n = p_atomic_inc_return(&outcomes[made]);
++   uint64_t mark = 1;
++   while (mark < n)
++      mark *= 10;
++   if (mark == n)
++      mesa_loge("NativeAdreno: BoAlloc found no memory; requested GPU cache reclaim; %s after %u wait%s (%llu time%s)",
++                made ? "succeeded" : "still out of memory", retries, retries == 1 ? "" : "s", (unsigned long long)n,
++                n == 1 ? "" : "s");
++}
++
+ static VkResult
+ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+                    uint64_t size, kern_return_t map_error, bool own_iova = true)
+@@ -912,6 +1060,7 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+       }
+    }
+ 
++   unsigned retries = 0;
+    for (bool flushed = false; !reused;) {
+       VkResult result = VK_SUCCESS;
+       if (lazy_vma)
+@@ -943,8 +1092,14 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+             if (any)
+                continue;
+          }
++         if (kr == kIOReturnNoMemory && darwin_retry_wait(dev, retire, retries)) {
++            ++retries;
++            continue;
++         }
++         darwin_retry_done(retire, retries, false);
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+       }
++      darwin_retry_done(retire, retries, true);
+ 
+       NativeAdrenoAbiBoMap map = {
+          .handle = reply.handle,
+@@ -1973,14 +2128,51 @@ darwin_device_init(struct tu_device *dev)
+    darwin_stats_state = retire;
+    darwin_watch_memory_pressure();
+    retire->pressure_seen = p_atomic_read(&darwin_memory_pressure);
++   retire->dev = dev;
++   retire->trim_queue = dispatch_queue_create("org.unixnu.sheng.gpu-trim", DISPATCH_QUEUE_SERIAL);
++   if (retire->trim_queue)
++      retire->trim_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, retire->trim_queue);
++   if (retire->trim_timer) {
++      dispatch_set_context(retire->trim_timer, retire);
++      dispatch_source_set_event_handler_f(retire->trim_timer, darwin_trim_fire);
++      dispatch_source_set_timer(retire->trim_timer, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
++      dispatch_activate(retire->trim_timer);
++      pthread_mutex_lock(&darwin_devices_lock);
++      for (unsigned i = 0; i < ARRAY_SIZE(darwin_devices); ++i)
++         if (!darwin_devices[i]) {
++            darwin_devices[i] = retire;
++            break;
++         }
++      pthread_mutex_unlock(&darwin_devices_lock);
++   }
+    return VK_SUCCESS;
+ }
+ 
++static void
++darwin_trim_stop(struct darwin_retire_state *retire)
++{
++   if (!retire->trim_timer)
++      return;
++   pthread_mutex_lock(&darwin_devices_lock);
++   for (unsigned i = 0; i < ARRAY_SIZE(darwin_devices); ++i)
++      if (darwin_devices[i] == retire)
++         darwin_devices[i] = NULL;
++   pthread_mutex_unlock(&darwin_devices_lock);
++   dispatch_source_cancel(retire->trim_timer);
++   dispatch_sync_f(retire->trim_queue, NULL, [](void *) {});
++   dispatch_release(retire->trim_timer);
++   retire->trim_timer = NULL;
++}
++
+ static void
+ darwin_device_finish(struct tu_device *dev)
+ {
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    if (retire) {
++      darwin_trim_stop(retire);
++      if (retire->trim_queue)
++         dispatch_release(retire->trim_queue);
++      retire->trim_queue = NULL;
+       pthread_mutex_lock(&dev->submit_mutex);
+       bool join_watcher = retire->fence_watcher_started;
+       retire->fence_watcher_stop = true;

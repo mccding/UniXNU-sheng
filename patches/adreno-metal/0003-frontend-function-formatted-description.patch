@@ -1,0 +1,16 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 3ebcfeb..89ca3ad 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1666,6 +1666,11 @@ static void libraryAirBytes(NBLibrary *library,const void *bytes,size_t length)
+  }
+ }
+ @implementation NBFunction
++- (NSString *)formattedDescription:(NSUInteger)indent {
++ NSString *padding=[@"" stringByPaddingToLength:MIN(indent,(NSUInteger)128) withString:@" " startingAtIndex:0];
++ return [NSString stringWithFormat:@"%@<NBFunction: %@>",padding,_name ?: @"unnamed"];
++}
++- (NSString *)description {return [self formattedDescription:0];}
+ - (NSArray *)stageInputAttributes {
+  if(!_handle)return nil;
+  int32_t count=nmb_function_attribute_count(_handle);if(count<=0)return nil;

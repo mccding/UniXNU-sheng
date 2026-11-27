@@ -1,0 +1,82 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index f98bb57..049541f 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2370,9 +2370,15 @@ struct EncodeThread {
+  std::deque<EncodeBatch *> batches;
+  std::vector<EncodeBatch *> spare;
+  uint64_t queued=0,done=0;
++ unsigned drains=0;
++ bool sleeping=false;
+ };
+ static thread_local bool tOnEncodeThread;
+ static thread_local EncodeBatch *tBatch;
++static bool encodeIsWindowServer() {return strcmp(getprogname(),"WindowServer")==0;}
++static bool encodeWindowServerPriorityWanted() {
++ return encodeIsWindowServer() && access("/private/var/ngpu/debug/no-encode-priority",F_OK)!=0;
++}
+ // The encoding thread does the render server's frame work for CoreAnimation's render thread, so it runs at that thread's scheduling
+ // policy and priority, as the work would on the render thread itself. Created at user-interactive QoS, it is a timeshare thread whose
+ // priority decayed under its own load (47 to 37 in untagged-102cb4a069) and then waited runnable behind other P-core work: 53 of 78
+@@ -2381,7 +2387,7 @@ static thread_local EncodeBatch *tBatch;
+ static std::atomic<pthread_t> gEncodeReference{nullptr};
+ static void encodeAdoptReference() {
+  static bool adopted=false;
+- if(adopted)return;
++ if(adopted || encodeWindowServerPriorityWanted())return;
+  const pthread_t reference=gEncodeReference.load(std::memory_order_acquire);
+  if(!reference)return;
+  adopted=true;
+@@ -2397,9 +2403,15 @@ static EncodeThread &encodeThread() {
+   pthread_create(&id,&attr,[](void *arg)->void * {
+    EncodeThread &t=*(EncodeThread *)arg;tOnEncodeThread=true;
+    pthread_setname_np("native-metal-encode");traceThread(2);
++   if(encodeWindowServerPriorityWanted()) {
++    sched_param param{};param.sched_priority=79;
++    if(FILE *f=fopen("/private/var/ngpu/debug/encode-priority","r")){int p=0;if(fscanf(f,"%d",&p)==1 && p>0 && p<128)param.sched_priority=p;fclose(f);}
++    const int rc=pthread_setschedparam(pthread_self(),SCHED_RR,&param);
++    static bool said=false;if(!said){said=true;NBLOG(@"native-metal: WindowServer encode thread SCHED_RR priority %d: %d",param.sched_priority,rc);}
++   }
+    std::unique_lock<std::mutex> lock(t.lock);
+    for(;;) {
+-    t.work.wait(lock,[&]{return !t.batches.empty();});
++    t.sleeping=true;t.work.wait(lock,[&]{return !t.batches.empty();});t.sleeping=false;
+     EncodeBatch *batch=t.batches.front();t.batches.pop_front();
+     const uint32_t depth=(uint32_t)t.batches.size(),tasks=(uint32_t)batch->count;
+     lock.unlock();tEncodeBatchId=batch->serial;
+@@ -2408,7 +2420,7 @@ static EncodeThread &encodeThread() {
+     const uint64_t cpuBefore=diagOn()?threadCpuUs():0;
+     @autoreleasepool {batch->run();}
+     batchStage(batch->serial,3,batch->enqueuedUs,tasks,depth,diagOn()?(uint32_t)(threadCpuUs()-cpuBefore):0);tEncodeBatchId=0;
+-    lock.lock();t.spare.push_back(batch);t.done++;t.idle.notify_all();
++    lock.lock();t.spare.push_back(batch);t.done++;if(t.drains)t.idle.notify_all();
+    }
+    return nullptr;
+   },t);
+@@ -2421,14 +2433,14 @@ static bool onEncodeQueue() {return tOnEncodeThread;}
+ static void encodeFlush() {
+  if(!tBatch || !tBatch->count)return;
+  EncodeThread &t=encodeThread();
+- uint64_t serial,queuedUs;uint32_t tasks,depth;
++ uint64_t serial,queuedUs;uint32_t tasks,depth;bool wake=false;
+  {std::lock_guard<std::mutex> lock(t.lock);
+   tBatch->serial=serial=++t.queued;tBatch->enqueuedUs=queuedUs=nowUs();
+   tasks=(uint32_t)tBatch->count;depth=(uint32_t)t.batches.size();
+-  t.batches.push_back(tBatch);tBatch=nullptr;
++  t.batches.push_back(tBatch);tBatch=nullptr;wake=t.sleeping;
+  }
+  batchStage(serial,1,queuedUs,tasks,depth);
+- t.work.notify_one();
++ if(wake)t.work.notify_one();
+ }
+ // A closure takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
+ template<class F> static void encodeLaterRaw(F &&work) {
+@@ -2447,7 +2459,7 @@ static void encodeDrain() {
+  EncodeThread &t=encodeThread();
+  std::unique_lock<std::mutex> lock(t.lock);
+  const uint64_t target=t.queued;
+- t.idle.wait(lock,[&]{return t.done>=target;});
++ t.drains++;t.idle.wait(lock,[&]{return t.done>=target;});t.drains--;
+ }
+ template<class F> struct TracedEncodeCall {
+  std::optional<F> work;const char *label;uint32_t line;uint64_t id,command,parent,queued;

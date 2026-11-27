@@ -25,4 +25,6 @@ sheng-startup-failure-log.patch
 sheng-process-exit-log.patch
 sheng-platform-sleep.patch
 sheng-4k-bootstrap-capacity-48.patch
+sheng-virtual-address-size-47.patch
+sheng-kmem-contig-ungobble.patch
 

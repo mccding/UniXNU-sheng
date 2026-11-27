@@ -1,0 +1,32 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 049541f..3ebcfeb 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1798,6 +1798,27 @@ static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString
+   if(!bytes || !v.data){if(error)*error=nbError([NSString stringWithFormat:@"constant type %lu is not qualified",(unsigned long)v.dataType]);return nil;}
+   constants.push_back({v.dataType,group?0:v.index,group?v.name.UTF8String:nullptr,v.data,bytes});
+  }
++ // QuartzCore's generic vertex functions take the actual texcoord counts from buffer 0.
++ // Without both optional FCs, the AIR static initializer loses its generic texture/chroma
++ // matrix predicates. Give the bridge defined operands without changing the runtime counts.
++ if([name isEqualToString:@"fixed_vert_lph_gen"] || [name isEqualToString:@"fixed_vert_lpf_gen"]) {
++  static const char *const countNames[]={"fc_texcoord_count0","fc_texcoord_count1"};
++  bool generic=false, hasCount[2]={};
++  for(const NmbConstant &c:constants) {
++   if(c.type==MTLDataTypeBool && (c.name?strcmp(c.name,"fc_generic")==0:c.index==0))
++    generic=*(const uint8_t *)c.bytes==1;
++   for(unsigned i=0;i<2;i++)
++    if(c.name?strcmp(c.name,countNames[i])==0:c.index==53+i)hasCount[i]=true;
++  }
++  if(generic && (!hasCount[0] || !hasCount[1])) {
++   static const uint8_t zero=0;
++   for(unsigned i=0;i<2;i++)
++    if(!hasCount[i])constants.push_back({MTLDataTypeUChar,0,countNames[i],&zero,sizeof zero});
++   static std::atomic_flag noted=ATOMIC_FLAG_INIT;
++   if(!noted.test_and_set(std::memory_order_relaxed))
++    NBLOG(@"native-metal: QuartzCore generic vertex texcoord matrices enabled (%@)",name);
++  }
++ }
+  std::string text;
+  for(const NmbConstant &c:constants) {
+   char head[32];if(!c.name)snprintf(head,sizeof head,"#%llu",(unsigned long long)c.index);

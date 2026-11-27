@@ -1,0 +1,22 @@
+From: xiaomi-sheng Stage 2 <sheng@unixnu.local>
+Subject: [PATCH] arm64: report T0SZ_USER (47-bit) in machdep.virtual_address_size
+
+On native 4K arm64e builds, zzzz-sheng-ipados27-bringup.patch gives user
+pmaps a 47-bit level-0 root (T0SZ_USER = 17ULL) while T0SZ_BOOT remains 26.
+bsd/dev/arm64/sysctl.c still returned 64 - T0SZ_BOOT (38), causing
+processes such as Chrome/V8 and CoreSymbolication to believe only 38 bits
+of user VA exist. Report 64 - T0SZ_USER (47) instead.
+
+diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
+--- a/bsd/dev/arm64/sysctl.c
++++ b/bsd/dev/arm64/sysctl.c
+@@ -319,7 +319,8 @@ static int
+ virtual_address_size SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(arg1, arg2, oidp)
+-	int return_value = 64 - T0SZ_BOOT;
++	/* sheng: user pmaps run at T0SZ_USER (47-bit L0 root on arm64e 4K), not T0SZ_BOOT (38-bit). */
++	int return_value = 64 - T0SZ_USER;
+ 	return SYSCTL_OUT(req, &return_value, sizeof(return_value));
+ }
+ 

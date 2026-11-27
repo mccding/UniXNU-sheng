@@ -1,0 +1,23 @@
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 89ca3ad..6f2dc90 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -918,6 +918,18 @@ static NSString *compileArguments(MTLCompileOptions *options) {
+   [arguments addObject:compileArgument([NSString stringWithFormat:@"-D%@=%@",name,value])];
+  }];
+  [arguments addObject:compileArgument([@"-fmodules-cache-path=" stringByAppendingString:[NSTemporaryDirectory() stringByAppendingPathComponent:@"m2v-msl"]])];
++ // The caller supplies already-tokenized compiler syntax, not one quoted argument.
++ // Core Image's runtime header needs its own macro definitions when it emits MSL.
++ SEL extraSelector=sel_registerName("additionalCompilerArguments");
++ if([options respondsToSelector:extraSelector]) {
++  id extra=((id (*)(id,SEL))objc_msgSend)(options,extraSelector);
++  if([extra isKindOfClass:[NSString class]] && [extra length]) {
++   [arguments addObject:extra];
++   static std::atomic_flag noted=ATOMIC_FLAG_INIT;
++   if(!noted.test_and_set(std::memory_order_relaxed))
++    os_log(OS_LOG_DEFAULT,"native-metal: compiler-extra-args-v1 forwarded");
++  }
++ }
+  return [arguments componentsJoinedByString:@" "];
+ }
+ static NSError *nbError(NSString *why) {
