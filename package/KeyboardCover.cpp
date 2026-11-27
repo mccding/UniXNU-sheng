@@ -1,26 +1,10 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// The sheng keyboard cover as one HID device: keyboard (report 5), consumer keys (report 6), keyboard power (report 7) and the
-// touchpad (report 0x19), compiled against the selected IOHIDFamily source interface. KeyboardProbe.cpp creates it when the cover
-// attaches, terminates it when the cover detaches and hands it the controller's input reports; only the touchpad report is rewritten
-// (Y from the other edge, palms lifted: wn8030_touchpad_report).
-//
-// One device with a Keyboard, a Touch Pad and Finger collections is what iPadOS's SmartCoverServiceFilter matches (all three usage
-// pairs on one service, a transport without "test"): it turns the touchpad's finger collections into pointer, scroll, scale, rotate
-// and tap events and reads the surface size from SurfaceDimensions. IOHIDDevice lists Application and Physical collections in the
-// usage pairs, so the fingers are Physical collections. The event driver derives SurfaceDimensions from the X and Y physical ranges
-// and converts only centimetres (unit 0x11) to millimetres, so the extents are given in centimetres: 9.35 x 5.55 cm.
-//
-// Keyboard Power (keyboard page 0x66) as a feature and an input element is the event driver's KeyboardEnabled state: the system shows
-// the on-screen keyboard while it is 0. The probe sends 0 while the cover is folded behind the tablet or closed over it.
-//
-// macOS takes the same keyboard and consumer keys, but neither of the other two: Keyboard Power is its power key (held down for as long
-// as the cover is open: the display dimmed and slept, and no key did anything), and its HID event driver makes no pointer events from a
-// touchpad's finger collections ("createEventForDigitizerCollection generates null event"; only Apple's own trackpads have a driver).
-// There the device is a keyboard and a pointer: the touchpad report becomes relative motion, scroll steps and two buttons
-// (Wn8030.c wn8030_pointer_report_at, with each report's arrival time), and the folded cover is silenced by KeyboardProbe.cpp alone.
+// The sheng keyboard cover as one HID device: keyboard (report 5), consumer keys (report 6), keyboard power (report 7, iPadOS only)
+// and touchpad (report 0x19 -> 8-byte pointer report 0x1a on macOS using Pad 8 Pro Wn8030Piano pointer state machine & HID extents).
 #include <IOKit/hid/IOHIDDevice.h>
 #include <kern/clock.h>
 #include "Wn8030.h"
+#include "PianoWn8030.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOCommandGate.h>
@@ -69,19 +53,26 @@ const uint8_t kDescriptor[] COVER_CONST = {
     0x19, 0x00, 0x2a, 0xff, 0x02, 0x15, 0x00, 0x26, 0xff, 0x02, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
     0xc0,
 #if NATIVE_COVER_POINTER
-    // Pointer: two buttons, X and Y as signed 16-bit relative counts, the wheel and the horizontal pan as signed bytes.
+    // Pointer (Report ID 0x1a): 3 buttons, X/Y signed 16-bit relative at 400 dpi, Wheel/AC Pan signed 8-bit at 90 scroll cpi (Pad 8 Pro).
     0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x1a, 0x09, 0x01, 0xa1, 0x00,
-    0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02,
-    0x95, 0x06, 0x81, 0x03,
-    // Raw counts at 828 counts/inch. Physical extents are thousandths of an inch; push/pop keeps units off the scroll axes.
-    0xa4, 0x65, 0x13, 0x55, 0x0d, 0x37, 0x6b, 0x65, 0xff, 0xff, 0x47, 0x95, 0x9a, 0x00, 0x00,
-    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x16, 0x01, 0x80, 0x26, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x02, 0x81, 0x06, 0xb4,
-    0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x81, 0x02,
+    0x75, 0x05, 0x95, 0x01, 0x81, 0x01,
+    0xa4,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
+    0x16, 0x01, 0x80, 0x26, 0xff, 0x7f,
+    0x36, 0x01, 0xe0, 0x46, 0xff, 0x1f,
+    0x65, 0x13, 0x55, 0x0e,
+    0x75, 0x10, 0x95, 0x02, 0x81, 0x06,
+    0x09, 0x38,
+    0x15, 0x81, 0x25, 0x7f,
+    0x36, 0x7d, 0xfa, 0x46, 0x83, 0x05,
+    0x55, 0x0d,
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
     0x05, 0x0c, 0x0a, 0x38, 0x02, 0x81, 0x06,
+    0xb4,
     0xc0, 0xc0,
 #else
-    // Touchpad: two buttons, three fingers (tip, in range, confidence, contact id, X 0..3047, Y 0..2031), contact count; the contact
-    // count maximum as a feature.
+    // Touchpad: two buttons, three fingers (tip, in range, confidence, contact id, X 0..3047, Y 0..2031), contact count.
     0x05, 0x0d, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x19,
     0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0x81, 0x02,
     0x95, 0x06, 0x81, 0x03,
@@ -112,20 +103,19 @@ class ShengKeyboardCover : public IOHIDDevice {
     IOBufferMemoryDescriptor *inputReport = nullptr;
     bool gateAdded = false, stopping = false, reporting = false;
 #if NATIVE_COVER_POINTER
-    struct wn8030_pointer pointer = {};
+    pianokeyboard::Pointer pointer;
+    pianokeyboard::Swipe pendingSwipe = pianokeyboard::Swipe::none;
     uint32_t timingAt = 0;
     bool timingSent = false;
 
-    // ShengTouchpadTiming, for `ioreg -r -c ShengKeyboardCover`: 32-bit little-endian words, layout 1, the touchpad reports, the
-    // pointer reports sent, the touches the pause rule restarted, the gap buckets (Wn8030.h wn8030_gap_bucket), then the controller's
-    // 17 counters. Published at device start and at most once a second of report time.
     void publishTiming(uint32_t now) {
         if (timingSent && now - timingAt < 1000) return;
         timingSent = true; timingAt = now;
-        uint32_t words[4 + WN8030_GAP_BUCKETS + 17];
-        words[0] = 1; words[1] = pointer.reports; words[2] = pointer.sent; words[3] = pointer.restarts;
-        for (unsigned i = 0; i < WN8030_GAP_BUCKETS; ++i) words[4 + i] = pointer.gaps[i];
-        for (unsigned i = 0; i < 17; ++i) words[4 + WN8030_GAP_BUCKETS + i] = static_cast<uint32_t>(native_keyboard_stats[i]);
+        uint32_t words[4 + pianokeyboard::kGapBuckets + 17];
+        words[0] = 1; words[1] = pointer.reports(); words[2] = pointer.sent(); words[3] = pointer.restarts();
+        const uint32_t *gaps = pointer.gaps();
+        for (unsigned i = 0; i < pianokeyboard::kGapBuckets; ++i) words[4 + i] = gaps[i];
+        for (unsigned i = 0; i < 17; ++i) words[4 + pianokeyboard::kGapBuckets + i] = static_cast<uint32_t>(native_keyboard_stats[i]);
         setProperty("ShengTouchpadTiming", words, sizeof words);
     }
 #endif
@@ -136,8 +126,6 @@ class ShengKeyboardCover : public IOHIDDevice {
         const uintptr_t count = reinterpret_cast<uintptr_t>(length);
         if (self->stopping || self->reporting) return kIOReturnNotReady;
         if (!self->inputReport || !count || count > kLongestReport) return kIOReturnBadArgument;
-        // The gate serializes producers. handleReport and its interface callbacks consume/copy the bytes before returning.
-        // A recursive callback must not overwrite a descriptor that is still being consumed.
         self->reporting = true;
         self->inputReport->setLength(count);
         const IOReturn result = self->inputReport->writeBytes(0, bytes, count) == count
@@ -154,16 +142,21 @@ public:
     void submit(const uint8_t *bytes, uint32_t length) {
         if (!gate || !bytes || !length || length > kLongestReport) return;
 #if NATIVE_COVER_POINTER
-        // Called from the probe's thread only, which owns the pointer state.
-        uint8_t moved[WN8030_POINTER_REPORT];
         if (bytes[0] == kTouchpadId) {
             if (length != WN8030_TOUCHPAD_REPORT) return;
             uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-            const uint32_t now = static_cast<uint32_t>(ns / 1000000);
-            length = wn8030_pointer_report_at(&pointer, bytes, now, moved);
-            publishTiming(now);
-            if (!length) return;
-            bytes = moved;
+            const uint64_t now = ns / 1000000;
+            uint8_t out7[2][pianokeyboard::kPointerBytes];
+            const unsigned count = pointer.touch(bytes, now, out7);
+            const pianokeyboard::Swipe sw = pointer.takeSwipe();
+            if (sw != pianokeyboard::Swipe::none) pendingSwipe = sw;
+            publishTiming(static_cast<uint32_t>(now));
+            for (unsigned i = 0; i < count; ++i) {
+                uint8_t moved[WN8030_POINTER_REPORT] = {WN8030_POINTER_ID};
+                memcpy(moved + 1, out7[i], pianokeyboard::kPointerBytes);
+                gate->runAction(&ShengKeyboardCover::submitAction, moved, reinterpret_cast<void *>(uintptr_t(WN8030_POINTER_REPORT)));
+            }
+            return;
         }
 #endif
         uint8_t copy[kLongestReport];
@@ -174,17 +167,38 @@ public:
         enabled = on ? 1 : 0;
 #if NATIVE_COVER_POINTER
         if (!on) {
-            pointer.fingers = 0;
-            pointer.buttons = 0;
-            pointer.click = 0;
-            pointer.move_x = 0;
-            pointer.move_y = 0;
-            pointer.scroll_x = 0;
-            pointer.scroll_y = 0;
+            pointer.reset();
+            pendingSwipe = pianokeyboard::Swipe::none;
         }
 #else
         const uint8_t report[2] = {kPowerId, enabled};
         submit(report, sizeof report);
+#endif
+    }
+    void configurePointer(bool gestures, bool keepLone) {
+#if NATIVE_COVER_POINTER
+        pianokeyboard::PointerConfig cfg = pointer.config();
+        cfg.gestures = gestures;
+        cfg.keepLoneContact = keepLone;
+        pointer.configure(cfg);
+#else
+        (void)gestures; (void)keepLone;
+#endif
+    }
+    void recordKeyTyped(uint64_t ms) {
+#if NATIVE_COVER_POINTER
+        pointer.keyTyped(ms);
+#else
+        (void)ms;
+#endif
+    }
+    uint8_t takeSwipeUsage() {
+#if NATIVE_COVER_POINTER
+        const pianokeyboard::Swipe s = pendingSwipe;
+        pendingSwipe = pianokeyboard::Swipe::none;
+        return pianokeyboard::swipeUsage(s);
+#else
+        return 0;
 #endif
     }
 
@@ -198,13 +212,12 @@ public:
         *out = IOBufferMemoryDescriptor::withBytes(kDescriptor, sizeof kDescriptor, kIODirectionNone);
         return *out ? kIOReturnSuccess : kIOReturnNoMemory;
     }
-    // Feature reads: the keyboard power state and the contact count maximum.
     IOReturn getReport(IOMemoryDescriptor *report, IOHIDReportType type, IOOptionBits options) override {
         if (!report || type != kIOHIDReportTypeFeature) return kIOReturnUnsupported;
         const uint8_t id = static_cast<uint8_t>(options & 0xff);
         uint8_t bytes[2] = {id, 0};
 #if NATIVE_COVER_POINTER
-        return kIOReturnUnsupported;   // this descriptor has no feature report
+        return kIOReturnUnsupported;
 #else
         if (id == kPowerId) bytes[1] = enabled;
         else if (id == kTouchpadId) bytes[1] = kMaxContacts;
@@ -213,12 +226,10 @@ public:
         native_keyboard_hid_stats[4] = native_keyboard_hid_stats[4] + 1;
         return report->writeBytes(0, bytes, sizeof bytes) == sizeof bytes ? kIOReturnSuccess : kIOReturnNoSpace;
     }
-    // Output: the Caps Lock LED, passed to the probe's thread (the controller is only spoken to from there).
     IOReturn setReport(IOMemoryDescriptor *report, IOHIDReportType type, IOOptionBits options) override {
         if (!report || type != kIOHIDReportTypeOutput) return kIOReturnUnsupported;
         uint8_t bytes[2] = {0, 0};
         const IOByteCount length = report->readBytes(0, bytes, sizeof bytes);
-        // With report IDs the report starts with its ID; a report without one is the LED byte alone.
         uint8_t leds;
         if (length >= 2 && bytes[0] == kKeyboardId) leds = bytes[1];
         else if (length == 1 && (options & 0xff) == kKeyboardId) leds = bytes[0];
@@ -236,7 +247,6 @@ public:
         gateAdded = true;
         inputReport = IOBufferMemoryDescriptor::withCapacity(kLongestReport, kIODirectionNone);
         if (!inputReport) return false;
-        // Mark Built-In so AppleUserHIDEventDriver sets HIDRMDeviceState=Allowed without 90s systemsettingsagent CPU churn.
         if (!setProperty("HIDDefaultBehavior", true)) return false;
         if (!setProperty("Built-In", true)) return false;
         if (!IOHIDDevice::start(provider)) return false;
@@ -273,6 +283,18 @@ extern "C" void sheng_keyboard_cover_input(IOService *device, const uint8_t *rep
 extern "C" void sheng_keyboard_cover_enable(IOService *device, bool enabled) {
     ShengKeyboardCover *cover = OSDynamicCast(ShengKeyboardCover, device);
     if (cover) cover->setEnabled(enabled);
+}
+extern "C" void sheng_keyboard_cover_configure(IOService *device, bool gestures, bool keepLone) {
+    ShengKeyboardCover *cover = OSDynamicCast(ShengKeyboardCover, device);
+    if (cover) cover->configurePointer(gestures, keepLone);
+}
+extern "C" void sheng_keyboard_cover_key_typed(IOService *device, uint64_t ms) {
+    ShengKeyboardCover *cover = OSDynamicCast(ShengKeyboardCover, device);
+    if (cover) cover->recordKeyTyped(ms);
+}
+extern "C" uint8_t sheng_keyboard_cover_take_swipe(IOService *device) {
+    ShengKeyboardCover *cover = OSDynamicCast(ShengKeyboardCover, device);
+    return cover ? cover->takeSwipeUsage() : 0;
 }
 extern "C" void sheng_keyboard_cover_output_sink(void (*sink)(void *, uint8_t), void *context) {
     gOutputContext = context;

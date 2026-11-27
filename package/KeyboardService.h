@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Scheduling policy for the WN8030 worker. Millisecond deadlines and injected I/O keep error recovery testable without hardware.
+// Scheduling policy for the WN8030 worker (Pad 8 Pro serving loop adapted onto GeniI2c).
+// Eliminates the permanent irqEmpty latch deadlock: uses 3-state reads, bursts only on Valid, and applies 50 ms backoff on high IRQ.
 #ifndef SHENG_KEYBOARD_SERVICE_H
 #define SHENG_KEYBOARD_SERVICE_H
 #include <stdint.h>
 
+enum class KeyboardRead : uint8_t { Error = 0, Empty = 1, Valid = 2 };
+
 struct KeyboardService {
-    static constexpr uint32_t keepaliveMs = 12000, retryMs = 100, drainBudget = 16;
+    static constexpr uint32_t keepaliveMs = 12000, retryMs = 100, highBackoffMs = 50, drainBudget = 8;
     uint32_t seen = 0, readFailures = 0, controlFailures = 0, recoveryTries = 0;
-    uint64_t keepalive = 0, retryDue = 0, recoveryDue = 0;
-    bool statePending = false, recovering = false;
+    uint64_t keepalive = 0, retryDue = 0, recoveryDue = 0, pollDue = 0, highBackoffDue = 0;
+    bool statePending = false, recovering = false, irqWasLow = true;
 
     template <typename IO> void step(IO &io) {
         if (recovering) {
@@ -21,28 +24,67 @@ struct KeyboardService {
             recovering = false;
             recoveryTries = readFailures = controlFailures = 0;
             retryDue = 0;
+            highBackoffDue = 0;
+            irqWasLow = !io.irqHigh();
             statePending = io.attached();
             keepalive = io.now();
+            pollDue = io.now() + io.pollIntervalMs();
         }
         if (retryDue && io.now() < retryDue) return;
         retryDue = 0;
-        // A failed read keeps its edge pending. A bounded batch lets the caller service hall and LED changes under load,
-        // and continues draining while PinIrq stays high with valid frames.
-        for (unsigned n = 0; n < drainBudget && (seen != io.irqs() || io.irqHigh()); ++n) {
+        // Drain edge-triggered and buffered frames: never follow an Empty read on the same wake (prevents 2x reads and irqEmpty lockup).
+        bool prevValid = false;
+        for (unsigned n = 0; n < drainBudget; ++n) {
             const bool hadEdge = seen != io.irqs();
-            if (!io.read()) {++readFailures; retryDue = io.now() + retryMs; break;}
+            const bool highReady = io.irqHigh() && (n == 0 ? io.now() >= highBackoffDue : prevValid);
+            if (!hadEdge && !highReady) break;
+            const KeyboardRead r = io.read();
+            if (r == KeyboardRead::Error) {
+                prevValid = false;
+                ++readFailures;
+                retryDue = io.now() + retryMs;
+                break;
+            }
             if (hadEdge) io.consumed(++seen);
             readFailures = 0;
+            if (r == KeyboardRead::Valid) {
+                prevValid = true;
+                highBackoffDue = 0;
+                io.activity(io.now());
+                pollDue = io.now() + io.pollIntervalMs();
+            } else {
+                prevValid = false;
+                highBackoffDue = io.irqHigh() ? io.now() + highBackoffMs : 0;
+                break;
+            }
+        }
+        if (!io.irqHigh()) {
+            irqWasLow = true;
+            highBackoffDue = 0;
+        } else {
+            irqWasLow = false;
+        }
+        // Poll once per PollPlan interval (1s active / 5s idle / 10s slow) as insurance against a missed rising edge.
+        if (!retryDue && io.now() >= pollDue) {
+            pollDue = io.now() + io.pollIntervalMs();
+            if (seen == io.irqs()) {
+                const KeyboardRead r = io.read();
+                if (r == KeyboardRead::Error) {
+                    ++readFailures;
+                    retryDue = io.now() + retryMs;
+                } else {
+                    readFailures = 0;
+                    if (r == KeyboardRead::Valid) {
+                        io.activity(io.now());
+                        pollDue = io.now() + io.pollIntervalMs();
+                    }
+                }
+            }
         }
         if (!retryDue && io.now() >= keepalive) {
             if (!io.attached() || io.power()) {
                 controlFailures = 0;
                 keepalive = io.now() + keepaliveMs;
-                // Poll once per health interval as insurance against a missed rising edge, including an attach at boot.
-                if (seen == io.irqs()) {
-                    if (!io.read()) {++readFailures; retryDue = keepalive = io.now() + retryMs;}
-                    else readFailures = 0;
-                }
             } else {
                 if (++controlFailures == 1) {io.release(); io.wake(); statePending = io.attached();}
                 retryDue = keepalive = io.now() + retryMs;
@@ -62,8 +104,11 @@ struct KeyboardService {
     uint64_t deadline(uint64_t now, uint32_t irqs, bool irqHigh = false) const {
         if (recovering) return recoveryDue;
         if (retryDue) return retryDue;
-        if (seen != irqs || irqHigh || statePending) return now;
-        return keepalive;
+        if (seen != irqs || statePending || (irqHigh && now >= highBackoffDue)) return now;
+        uint64_t due = keepalive;
+        if (pollDue && pollDue < due) due = pollDue;
+        if (irqHigh && highBackoffDue && highBackoffDue < due) due = highBackoffDue;
+        return due;
     }
 };
 #endif

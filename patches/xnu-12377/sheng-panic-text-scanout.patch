@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] sheng: boot-gated panic text on retained linear scanout
+
+Ported from Pad 8 Pro (0073-panic-text.patch), adapted for sheng's 3048x2032 scanout
+(dynamic scale = 4 for >=2560x1600, 5 for >=3200x2000) and UniXNU's #if defined(__arm64__).
+Requires piano-panic-text=1 boot argument; draws before panic-hold / reset.
+
+---
+diff --git a/osfmk/console/Makefile b/osfmk/console/Makefile
+index 59e0027..1600e9c 100644
+--- a/osfmk/console/Makefile
++++ b/osfmk/console/Makefile
+@@ -9,6 +9,8 @@ include $(MakeInc_def)
+ DATAFILES =
+ 
+ PRIVATE_DATAFILES = \
++	piano_panic_text.h \
++	piano_panic_text_core.h \
+ 	video_console.h \
+ 	serial_protos.h
+ 
+diff --git a/osfmk/console/piano_panic_text.h b/osfmk/console/piano_panic_text.h
+new file mode 100644
+index 0000000..cb367f6
+--- /dev/null
++++ b/osfmk/console/piano_panic_text.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ * Ported from Pad 8 Pro (0073-panic-text.patch) for Xiaomi Pad 6S Pro (sheng). */
++#ifndef PIANO_PANIC_TEXT_H
++#define PIANO_PANIC_TEXT_H
++#include <stdint.h>
++void piano_panic_text_begin(void);
++void piano_panic_text_putc(char);
++void piano_panic_text_draw(void);
++#endif
+diff --git a/osfmk/console/piano_panic_text_core.h b/osfmk/console/piano_panic_text_core.h
+new file mode 100644
+index 0000000..e82f9e0
+--- /dev/null
++++ b/osfmk/console/piano_panic_text_core.h
+@@ -0,0 +1,101 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent
++ * Ported from Pad 8 Pro (0073-panic-text.patch) for Xiaomi Pad 6S Pro (sheng).
++ * Panic-only, bounded text selection and BGRA rendering. No kernel services.
++ */
++#ifndef PIANO_PANIC_TEXT_CORE_H
++#define PIANO_PANIC_TEXT_CORE_H
++#include <stdint.h>
++#include <stddef.h>
++#define PPT_BYTES 32768u
++#define PPT_COLS 78u
++#define PPT_ROWS 24u
++struct ppt_capture { uint32_t used, active; char text[PPT_BYTES]; };
++struct ppt_page { unsigned x, y; char cells[PPT_ROWS][PPT_COLS]; };
++static inline void ppt_put(struct ppt_page *p, char c)
++{
++    if (p->y >= PPT_ROWS) return;
++    if (c == '\r') return;
++    if (c == '\n') { p->x = 0; ++p->y; return; }
++    if (c == '\t') c = ' ';
++    if ((unsigned char)c < 32 || (unsigned char)c > 126) c = '?';
++    p->cells[p->y][p->x++] = c;
++    if (p->x == PPT_COLS) { p->x = 0; ++p->y; }
++}
++static inline void ppt_string(struct ppt_page *p, const char *s)
++{ while (*s) ppt_put(p, *s++); }
++static inline int ppt_has(const char *s, unsigned n, const char *key)
++{
++    for (unsigned i = 0; i < n; ++i) {
++        unsigned k = 0;
++        while (key[k] && i + k < n && s[i + k] == key[k]) ++k;
++        if (!key[k]) return 1;
++    }
++    return 0;
++}
++static inline void ppt_line(struct ppt_page *p, const char *s, unsigned n)
++{
++    for (unsigned i = 0; i < n; ++i) ppt_put(p, s[i]);
++    if (p->x) ppt_put(p, '\n');
++}
++static inline void ppt_select(struct ppt_page *p, const char *s, unsigned n)
++{
++    unsigned start = 0, frames = 0, panic_rows = 0;
++    int in_panic = 0, found = 0, in_backtrace = 0;
++    for (unsigned y = 0; y < PPT_ROWS; ++y)
++        for (unsigned x = 0; x < PPT_COLS; ++x) p->cells[y][x] = ' ';
++    p->x = p->y = 0;
++    ppt_string(p, "SHENG PANIC TEXT v1\n");
++    for (unsigned end = 0; end <= n; ++end) {
++        if (end < n && s[end] != '\n') continue;
++        unsigned len = end - start;
++        const char *line = s + start;
++        if (ppt_has(line, len, "panic(cpu")) { in_panic = found = 1; }
++        if (ppt_has(line, len, "Panicked thread:") && ppt_has(line, len, "backtrace:")) in_backtrace = 1;
++        int frame = in_backtrace && ppt_has(line, len, "lr: 0x") && ppt_has(line, len, "fp: 0x");
++        if (frame && frames < 12) {
++            if (!frames) { if (p->y < 8) p->y = 8; p->x = 0; ppt_string(p, "FIRST 12 BACKTRACE FRAMES (LR / FP)\n"); }
++            ppt_line(p, line, len); ++frames; in_panic = 0;
++        } else if (in_panic && panic_rows < 5 && p->y < 6) {
++            if (ppt_has(line, len, "Debugger message:") || ppt_has(line, len, "Memory ID:")) in_panic = 0;
++            else {
++                unsigned room = (6 - p->y) * PPT_COLS - p->x;
++                ppt_line(p, line, len < room ? len : room);
++                ++panic_rows;
++            }
++        } else if (!frames && (ppt_has(line, len, "Kernel slide:") || ppt_has(line, len, "Kernel text base:") ||
++                              ppt_has(line, len, "KernelCache slide:") || ppt_has(line, len, "KernelCache base:"))) {
++            if (p->y < 8) ppt_line(p, line, len);
++        }
++        start = end + 1;
++    }
++    if (!found) { p->x = 0; p->y = 1; ppt_string(p, "PANIC STRING MISSING - CHANNEL NOT QUALIFIED\n"); }
++    if (!frames) { p->x = 0; p->y = 9; ppt_string(p, "BACKTRACE MISSING - CHANNEL NOT QUALIFIED\n"); }
++    p->x = 0; p->y = PPT_ROWS - 1;
++    ppt_string(p, n == PPT_BYTES ? "CAPTURE FULL - TRUNCATED" : "END SHENG PANIC TEXT v1");
++}
++static inline int ppt_render(volatile uint32_t *fb, unsigned width, unsigned height,
++                             unsigned stride, unsigned depth, const unsigned char *font,
++                             const struct ppt_page *p)
++{
++    if (!fb || !font || !p || width < 1024 || height < 768 || stride < width * 4 || (stride & 3) != 0 || depth != 32) return 0;
++    const unsigned scale = width >= 3200 && height >= 2000 ? 5 : width >= 2560 && height >= 1600 ? 4 : 3;
++    const unsigned left = 40, top = 40;
++    const unsigned charW = 8 * scale, charH = 16 * scale;
++    if (left + PPT_COLS * charW > width || top + PPT_ROWS * charH > height) return 0;
++    for (unsigned y = 0; y < height; ++y)
++        for (unsigned x = 0; x < width; ++x) fb[y * (stride / 4) + x] = 0x00101010;
++    for (unsigned row = 0; row < PPT_ROWS; ++row)
++        for (unsigned col = 0; col < PPT_COLS; ++col) {
++            unsigned c = (unsigned char)p->cells[row][col];
++            for (unsigned gy = 0; gy < 16; ++gy)
++                for (unsigned gx = 0; gx < 8; ++gx) {
++                    uint32_t pixel = font[c * 16 + gy] & (1u << gx) ? 0x00ffffff : 0x00101010;
++                    for (unsigned dy = 0; dy < scale; ++dy)
++                        for (unsigned dx = 0; dx < scale; ++dx)
++                            fb[(top + row * charH + gy * scale + dy) * (stride / 4) +
++                               left + col * charW + gx * scale + dx] = pixel;
++                }
++        }
++    return 1;
++}
++#endif
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+index 648cb70..d5f457d 100644
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -2773,6 +2773,41 @@ gc_pause( boolean_t pause, boolean_t graphics_now )
+ 			thread_call_enter_delayed(&vc_progressmeter_call, vc_progressmeter_deadline);
+ 		} else
+ #endif /* defined(XNU_TARGET_OS_OSX) */
++
++#if defined(__arm64__)
++#include <console/piano_panic_text.h>
++#include <console/piano_panic_text_core.h>
++static struct ppt_capture piano_text;
++static struct ppt_page piano_page;
++static int piano_panic_text_enabled(void)
++{
++	uint32_t enabled = 0;
++	PE_parse_boot_argn("piano-panic-text", &enabled, sizeof(enabled));
++	return enabled == 1;
++}
++void piano_panic_text_begin(void)
++{
++	if (piano_panic_text_enabled()) {
++		(void)__atomic_exchange_n(&piano_text.active, 1u, __ATOMIC_RELAXED);
++	}
++}
++void piano_panic_text_putc(char c)
++{
++	if (!__atomic_load_n(&piano_text.active, __ATOMIC_RELAXED)) return;
++	unsigned slot = __atomic_fetch_add(&piano_text.used, 1u, __ATOMIC_RELAXED);
++	if (slot < PPT_BYTES) piano_text.text[slot] = c;
++}
++void piano_panic_text_draw(void)
++{
++	if (!piano_panic_text_enabled()) return;
++	unsigned n = __atomic_load_n(&piano_text.used, __ATOMIC_RELAXED);
++	if (n > PPT_BYTES) n = PPT_BYTES;
++	ppt_select(&piano_page, piano_text.text, n);
++	(void)ppt_render((volatile uint32_t *)vinfo.v_baseaddr, vinfo.v_width,
++	    vinfo.v_height, vinfo.v_rowbytes, vinfo.v_depth, iso_font, &piano_page);
++	__builtin_arm_dsb(0xf);
++}
++#endif
+ 		thread_call_enter_delayed(&vc_progress_call, vc_progress_deadline);
+ 	}
+ 
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 4ce927a..0958775 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1,3 +1,6 @@
++#if defined(__arm64__)
++#include <console/piano_panic_text.h>
++#endif
+ /*
+  * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+  *
+@@ -837,6 +840,9 @@ check_and_handle_nested_panic(uint64_t panic_options_mask, unsigned long panic_c
+ #pragma clang diagnostic pop
+ 	extern void boot_log_panic_record(const char *, va_list *, unsigned long) __attribute__((weak_import));
+ 	if (&boot_log_panic_record) boot_log_panic_record(panic_format_str, panic_args, panic_caller);
++#if defined(__arm64__)
++	piano_panic_text_begin();
++#endif
+ 			printf("\n<end nested panic string>\n");
+ 		}
+ 	}
+@@ -1357,6 +1363,11 @@ panic_stackshot_release_lock(void)
+ static void
+ kdp_machine_reboot_type(unsigned int type, uint64_t debugger_flags)
+ {
++#if defined(__arm64__)
++	if (type == kPEPanicRestartCPU || type == kPEPanicRestartCPUNoCallouts) {
++		piano_panic_text_draw();
++	}
++#endif
+ 	if ((type == kPEPanicRestartCPU) && (debugger_flags & DEBUGGER_OPTION_SKIP_PANICEND_CALLOUTS)) {
+ 		PEHaltRestart(kPEPanicRestartCPUNoCallouts);
+ 	} else {
+diff --git a/osfmk/kern/printf.c b/osfmk/kern/printf.c
+index 2fc6931..01575d6 100644
+--- a/osfmk/kern/printf.c
++++ b/osfmk/kern/printf.c
+@@ -1,3 +1,6 @@
++#if defined(__arm64__)
++#include <console/piano_panic_text.h>
++#endif
+ /*
+  * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+  *
+@@ -925,6 +928,9 @@ vprintf(const char *fmt, va_list ap)
+ void
+ consdebug_putc(char c)
+ {
++#if defined(__arm64__)
++	piano_panic_text_putc(c);
++#endif
+ 	console_write_char(c);
+ 
+ 	debug_putc(c);
+@@ -941,6 +947,9 @@ consdebug_putc(char c)
+ void
+ consdebug_putc_unbuffered(char c)
+ {
++#if defined(__arm64__)
++	piano_panic_text_putc(c);
++#endif
+ 	console_write_unbuffered(c);
+ 
+ 	debug_putc(c);

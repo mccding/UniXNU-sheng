@@ -35,14 +35,42 @@ static uint64_t psci(uint64_t fid, uint64_t a1) {
 }
 
 #if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+extern void piano_panic_text_draw(void) __attribute__((weak_import));
 static int platform_off_available, platform_reset_available;
+static uint32_t platform_panic_hold_ms;
 static int platform_power_invoke(uint32_t fid) {
   const int64_t status = (int64_t)psci(fid, 0);
   // A completed PSCI transition never returns to this kernel.
   IOLog("[power] PSCI %x returned %lld\n", fid, (long long)status);
   return -1;
 }
+static void platform_panic_hold(void) {
+  if (&piano_panic_text_draw) piano_panic_text_draw();
+  if (!platform_panic_hold_ms) return;
+  __asm__ volatile ("msr DAIFSet, #0xf" ::: "memory");
+  uint64_t freq = 0;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r"(freq));
+  if (!freq) freq = 19200000;
+  __asm__ volatile ("isb" ::: "memory");
+  uint64_t start = 0, last_ping = 0;
+  __asm__ volatile ("mrs %0, cntpct_el0" : "=r"(start));
+  last_ping = start;
+  const uint64_t hold_ticks = freq * (uint64_t)platform_panic_hold_ms / 1000u;
+  const uint64_t ping_ticks = freq * 2u;
+  for (;;) {
+    uint64_t cur = 0;
+    __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r"(cur));
+    if (cur - start >= hold_ticks) break;
+    if (cur - last_ping >= ping_ticks) {
+      boot_reset_watchdog_ping();
+      last_ping = cur;
+    }
+  }
+}
 static int platform_halt_restart(unsigned type) {
+  if (type == kPEPanicRestartCPU || type == kPEPanicRestartCPUNoCallouts) {
+    platform_panic_hold();
+  }
   IOLog("[power] platform request %u off=%d reset=%d\n", type,
         platform_off_available, platform_reset_available);
   return boot_power_dispatch(type, platform_off_available, platform_reset_available,
@@ -51,11 +79,16 @@ static int platform_halt_restart(unsigned type) {
 void boot_reset_install_platform(void) {
   platform_off_available = (int32_t)psci(PsciFeatures, BootPowerOff) >= 0;
   platform_reset_available = (int32_t)psci(PsciFeatures, BootPowerReset) >= 0;
+  uint32_t hold_ms = 0;
+  if (PE_parse_boot_argn("panic-hold-ms", &hold_ms, sizeof hold_ms)) {
+    platform_panic_hold_ms = hold_ms > 30000u ? 30000u : hold_ms;
+  }
   int (*expected)(unsigned) = NULL;
   const int installed = __atomic_compare_exchange_n(&PE_halt_restart, &expected,
       platform_halt_restart, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-  IOLog("[power] platform handler %s off=%d reset=%d\n",
-        installed ? "installed" : "retained", platform_off_available, platform_reset_available);
+  IOLog("[power] platform handler %s off=%d reset=%d panic-hold-ms=%u\n",
+        installed ? "installed" : "retained", platform_off_available, platform_reset_available,
+        platform_panic_hold_ms);
 }
 #endif
 

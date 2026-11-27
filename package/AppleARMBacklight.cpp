@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Panel brightness for the sheng board (boot argument backlight=1, started by BacklightProbe.cpp). The panel's backlight is two Kinetic KTZ8866 drivers at I2C
 // address 0x11, one on the QUP wrap1 serial engine 1 (i2c@a84000, "ktz8866a") and one on the I2C hub engine 2 (i2c@988000, "ktz8866b");
-// both get the same 11-bit level in BL_BRT_LSB (0x04, bits 2:0) and BL_BRT_MSB (0x05), as the mainline ktz8866 driver writes it.
-// The engines run the GENI I2C firmware the boot loaders left loaded and clocked; this code votes their clocks on again, keeps the clock
-// and SCL timing the boot loader set and only issues FIFO transfers through the event-driven core in GeniI2c.c.
-// Transfers never wait: each engine's interrupt (SPI 354 for a, SPI 466 for b, level) only reads and clears the engine's status, records
-// it and signals the service's work loop, which advances the transfer. Until the interrupts are attached (the GIC driver may start
-// later; attaching is retried every 250 ms from a timer) the work loop polls the status every millisecond while a transfer runs. A step
-// that gets no answer within 25 ms is cancelled, then aborted. A newer level replaces one not yet written, so a fade never queues up.
-// The class cannot be called AppleARMBacklight: AppleARMPlatform already defines that class, and a duplicate name panics the kernel when
-// this file's classes are registered (int-229); the service answers user space's conformance query for it instead (publishFirst). Whether
-// CoreBrightness drives ShengBacklight is what native_backlight_stats[1] (brightness sets) shows. CoreBrightness (backboardd) looks for a backlight service with backlight-control = true, reads min and max from
-// IODisplayParameters brightness and sets {brightness, FadePeriod (16.16 seconds)} through setProperties. A fade is stepped every 16 ms by a
-// timer on the service's own work loop. iPadOS 27 reads a nits range and sets brightness-nits (signed 16.16) instead, and ramps by itself.
+// both get the same 11-bit level in BL_BRT_LSB (0x04, bits 2:0) and BL_BRT_MSB (0x05), and blank via BL_EN (0x08) bit 6.
+// Exponential/linear mapping, calibration and steps follow Pad 8 Pro (ShengBacklightCurve.h / AndroidBrightness / Ktz8866).
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
@@ -28,6 +18,7 @@
 #include <pexpert/pexpert.h>
 #include "GeniI2c.h"
 #include "LidClamshell.h"
+#include "ShengBacklightCurve.h"
 #if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
@@ -55,11 +46,10 @@ constexpr uint32_t kGccVote = 0x52008;
 // gcc-sm8550.c: wrap1 core_2x 18, core 19, m_ahb 20, s_ahb 21, s1 23; i2c hub s_ahb 7, core 8, s2 12.
 constexpr uint32_t kVoteBits = (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21) | (1u << 23) | (1u << 7) | (1u << 8) | (1u << 12);
 constexpr uint32_t kHalt[] = {0x23294, 0x23284, 0x2327c, 0x23280, 0x1813c, 0x23140, 0x23144, 0x1703c};
-constexpr uint8_t kAddress = 0x11, kBrtLsb = 0x04, kBrtMsb = 0x05;
-// The range CoreBrightness works in. The top level stands for kMaxNits: the panel's luminance has not been measured, so these set the slider's
-// scale, not an absolute brightness. kMidNits is CoreBrightness's own default.
-constexpr uint32_t kMinNits = 2, kMidNits = 140, kMaxNits = 500;
-constexpr uint32_t kMaxLevel = 2047, kStepMs = 16, kPollMs = 1, kStepDeadlineMs = 25, kAttachMs = 250, kAttachTries = 240;
+constexpr uint8_t kAddress = shengbacklight::kAddress;
+constexpr uint32_t kMinNits = shengbacklight::kMinNits, kMidNits = shengbacklight::kMidNits, kMaxNits = shengbacklight::kMaxNits;
+constexpr uint32_t kFloorCode = shengbacklight::kFloorCode, kMaxLevel = shengbacklight::kFullScale;
+constexpr uint32_t kStepMs = 16, kPollMs = 1, kStepDeadlineMs = 25, kAttachMs = 250, kAttachTries = 240;
 
 struct Window {IOMemoryMap *map; volatile uint32_t *va;};
 Window gGcc, gSe[2];
@@ -67,23 +57,21 @@ volatile uint32_t gIrqStatus[2];
 IOInterruptEventSource *volatile gInbox;
 ShengBacklight *volatile gBacklight = nullptr;
 volatile uint32_t gLastLevel = 0;
+volatile uint32_t gExponential = 1;
 volatile uint32_t gDirectSetProps = 0;
 volatile uint32_t gSwapNitsActive = 0;
 volatile uint32_t gSetPropsLogCount = 0;
 // The newest brightness asked for: goal << 16 | fade milliseconds, with bit 63 set while the work loop has not taken it.
 volatile uint64_t gRequest;
-// 1 while the keyboard cover's lid is closed (sheng_backlight_lid): the level written to the panel is none (LidClamshell.h).
+// 1 while the keyboard cover's lid is closed (sheng_backlight_lid): panel is blanked via BL_EN (LidClamshell.h).
 volatile uint32_t gLidClosed;
-// The lid timer of the running service, armed by sheng_backlight_lid to apply the lid on the work loop.
 IOTimerEventSource *volatile gLidTimer;
-// 1 from the system's will-sleep notification (macOS platform sleep) until the display shows frames again after the wake
-// (lid_backlight_wake_ready): the panel is dark too.
+// 1 from the system's will-sleep notification (macOS platform sleep) until the display shows frames again after the wake.
 volatile uint32_t gSystemAsleep;
-// 1 from the has-powered-on notification until then, with the display's frame count and the time at the wake.
 volatile uint32_t gWaking, gWakeFrames;
 volatile uint64_t gWakeAt;
-// The wake timer of the running service, armed by the has-powered-on notification.
 IOTimerEventSource *volatile gWakeTimer;
+
 uint32_t shownFrames(bool &counted) {
     counted = &native_legacy_swapstat != nullptr;
     return counted ? native_legacy_swapstat[7] + native_legacy_swapstat[9] + native_legacy_swapstat[10] : 0;
@@ -108,10 +96,6 @@ void seIrq(void *context) {
     const unsigned index = (unsigned)(uintptr_t)context;
     volatile uint32_t *se = gSe[index].va;
     const uint32_t status = rd(se, GENI_M_IRQ_STATUS);
-    // The TX watermark is a level: it is raised again as soon as it is cleared while the FIFO is below the watermark, which stays so
-    // until the work loop puts the data in. Cleared here alone it kept the line up (int-279: 25 million interrupts per engine in 300 s,
-    // the work loop starved and ran 2 of 188 brightness requests), so the watermark is turned off here; the status bit still tells the
-    // work loop to fill the FIFO.
     if (status & GENI_M_TX_WATERMARK) wr(se, GENI_TX_WATERMARK, 0);
     if (status) wr(se, GENI_M_IRQ_CLEAR, status);
     else native_backlight_request[4] = native_backlight_request[4] + 1;
@@ -125,31 +109,75 @@ void seIrq(void *context) {
 
 class ShengBacklight : public IOService {
     OSDeclareDefaultStructors(ShengBacklight)
-    // What one engine is doing: reading the level at start, then writing LSB and MSB of the newest level asked for.
-    enum Step : uint8_t {StepNone, StepReadLsb, StepReadMsb, StepWriteLsb, StepWriteMsb};
-    struct Engine {GeniI2c bus; Step step; bool started, usable; uint8_t lsb; int32_t written; uint32_t sending; uint64_t deadline;};
+    enum Step : uint8_t {StepNone, StepReadId, StepReadCfg1, StepReadEn, StepReadLsb, StepReadMsb, StepWriteLsb, StepWriteMsb, StepWriteEn};
+    struct Engine {
+        GeniI2c bus;
+        Step step;
+        bool started, usable, cfg1Valid, enValid, lit, targetLit;
+        uint8_t id, cfg1, foundEn, lsb, enRetries;
+        int32_t written;
+        uint32_t sending;
+        uint64_t deadline;
+    };
     Engine engine[2] = {};
     IOWorkLoop *loop = nullptr;
     IOTimerEventSource *fade = nullptr, *tick = nullptr, *attachTimer = nullptr, *request = nullptr, *lid = nullptr, *wake = nullptr;
     IOInterruptEventSource *inbox = nullptr;
-    uint32_t level = 0, from = 0, to = 0, target = 0, attachTries = 0;
+    uint32_t level = 0, from = 0, to = 0, targetCode = 0, attachTries = 0;
+    bool targetDark = false, exponential = true;
     uint64_t start = 0, period = 0;
     bool irqMode = false, published = false;
 
     static uint64_t now() {return mach_absolute_time();}
     static uint64_t after(uint32_t ms) {uint64_t delta = 0; nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &delta); return now() + delta;}
 
+    static uint32_t clampLit(uint32_t code) {
+        return code < kFloorCode ? kFloorCode : code > kMaxLevel ? kMaxLevel : code;
+    }
+
     // Starts the engine's next transfer when it is free.
     void kick(unsigned i) {
         Engine &e = engine[i];
         if (!e.usable || geni_i2c_busy(&e.bus)) return;
         int rc = 0;
-        if (!e.started) {e.step = StepReadLsb; rc = geni_i2c_start_read(&e.bus, kBrtLsb);}
-        else if (e.written != (int32_t)target) {e.sending = target; e.step = StepWriteLsb; rc = geni_i2c_start_write(&e.bus, kBrtLsb, (uint8_t)(target & 7));}
-        else {e.step = StepNone; return;}
+        if (!e.started) {
+            e.step = StepReadId;
+            rc = geni_i2c_start_read(&e.bus, shengbacklight::kRegId);
+            if (rc) {e.started = true; e.written = -1; native_backlight_stats[3 + i] = -1;}
+        } else if (targetDark) {
+            if (e.enValid && e.lit) {
+                e.targetLit = false;
+                e.step = StepWriteEn;
+                rc = geni_i2c_start_write(&e.bus, shengbacklight::kRegEn, shengbacklight::enableValue(e.foundEn, false));
+                if (rc) {e.lit = false; e.step = StepNone; return;}
+            } else if (!e.enValid && e.written != 0) {
+                e.sending = 0;
+                e.step = StepWriteLsb;
+                rc = geni_i2c_start_write(&e.bus, shengbacklight::kRegBrtLsb, 0);
+                if (rc) {e.written = 0; e.step = StepNone; return;}
+            } else {
+                e.step = StepNone;
+                return;
+            }
+        } else if (e.written != (int32_t)targetCode) {
+            e.sending = targetCode;
+            e.step = StepWriteLsb;
+            rc = geni_i2c_start_write(&e.bus, shengbacklight::kRegBrtLsb, (uint8_t)(targetCode & 7));
+            if (rc) {e.written = (int32_t)targetCode; e.step = StepNone; return;}
+        } else if (e.enValid && !e.lit) {
+            // Write BL_BRT_LSB/MSB before turning BL_EN bit 6 on (Pad 8 Pro Ktz8866.h contract).
+            e.targetLit = true;
+            e.step = StepWriteEn;
+            rc = geni_i2c_start_write(&e.bus, shengbacklight::kRegEn, shengbacklight::enableValue(e.foundEn, true));
+            if (rc) {e.lit = true; e.step = StepNone; return;}
+        } else {
+            e.step = StepNone;
+            return;
+        }
         if (rc) {e.step = StepNone; return;}
         e.deadline = after(kStepDeadlineMs);
     }
+
     void noteFailure(unsigned i) {
         const Engine &e = engine[i];
         bump(5);
@@ -157,6 +185,7 @@ class ShengBacklight : public IOService {
         native_backlight_stats[9] = (int32_t)(i << 8 | e.bus.error);
         native_backlight_stats[13] = (int32_t)(engine[0].bus.timeouts + engine[1].bus.timeouts);
     }
+
     // A transfer ended: the next step of the engine's sequence.
     void finished(unsigned i, int result) {
         Engine &e = engine[i];
@@ -165,8 +194,32 @@ class ShengBacklight : public IOService {
         else bump(15);
         int rc = 0;
         switch (e.step) {
+        case StepReadId:
+            if (ok) e.id = e.bus.data;
+            rc = geni_i2c_start_read(&e.bus, shengbacklight::kRegCfg1);
+            e.step = StepReadCfg1;
+            break;
+        case StepReadCfg1:
+            if (ok) {e.cfg1 = e.bus.data; e.cfg1Valid = true;}
+            rc = geni_i2c_start_read(&e.bus, shengbacklight::kRegEn);
+            e.step = StepReadEn;
+            break;
+        case StepReadEn:
+            if (ok) {
+                e.foundEn = e.bus.data;
+                e.enValid = true;
+                e.lit = (e.bus.data & shengbacklight::kEnBacklight) != 0;
+            }
+            rc = geni_i2c_start_read(&e.bus, shengbacklight::kRegBrtLsb);
+            e.step = StepReadLsb;
+            break;
         case StepReadLsb:
-            if (ok) {e.lsb = e.bus.data; rc = geni_i2c_start_read(&e.bus, kBrtMsb); e.step = StepReadMsb; break;}
+            if (ok) {
+                e.lsb = e.bus.data;
+                rc = geni_i2c_start_read(&e.bus, shengbacklight::kRegBrtMsb);
+                e.step = StepReadMsb;
+                break;
+            }
             e.started = true; e.written = -1; native_backlight_stats[3 + i] = -1;
             break;
         case StepReadMsb:
@@ -175,28 +228,49 @@ class ShengBacklight : public IOService {
             native_backlight_stats[3 + i] = e.written;
             break;
         case StepWriteLsb:
-            if (ok) {rc = geni_i2c_start_write(&e.bus, kBrtMsb, (uint8_t)((e.sending >> 3) & 0xff)); e.step = StepWriteMsb; break;}
-            e.written = (int32_t)e.sending;  // given up: written again with the next level asked for
+            if (ok) {
+                rc = geni_i2c_start_write(&e.bus, shengbacklight::kRegBrtMsb, (uint8_t)((e.sending >> 3) & 0xff));
+                e.step = StepWriteMsb;
+                break;
+            }
+            e.written = (int32_t)e.sending;
             break;
         case StepWriteMsb:
             e.written = (int32_t)e.sending;
             if (ok) native_backlight_stats[2] = (int32_t)e.sending;
             break;
+        case StepWriteEn:
+            if (ok) {
+                e.lit = e.targetLit;
+                e.foundEn = shengbacklight::enableValue(e.foundEn, e.targetLit);
+                e.enRetries = 0;
+                if (!e.targetLit) native_backlight_stats[2] = 0;
+                else native_backlight_stats[2] = (int32_t)targetCode;
+            } else if (++e.enRetries >= 2) {
+                e.lit = e.targetLit;
+                e.enRetries = 0;
+            }
+            break;
         default:
             break;
         }
-        if (rc) noteFailure(i);
+        if (rc) {
+            noteFailure(i);
+            if (!e.started) {e.started = true; e.written = -1; native_backlight_stats[3 + i] = -1;}
+        }
         if (geni_i2c_busy(&e.bus)) {e.deadline = after(kStepDeadlineMs); return;}
         e.step = StepNone;
         if (!published && engine[0].started && engine[1].started) publishFirst();
         kick(i);
     }
+
     void advance(unsigned i, uint32_t status) {
         Engine &e = engine[i];
         if (!geni_i2c_busy(&e.bus)) return;
         const int result = geni_i2c_event(&e.bus, status);
         if (result != GeniPending) finished(i, result);
     }
+
     void armTick() {
         bool busy = false;
         uint64_t soonest = UINT64_MAX;
@@ -205,7 +279,7 @@ class ShengBacklight : public IOService {
         if (!irqMode) {tick->setTimeoutMS(kPollMs); return;}
         tick->wakeAtTime((AbsoluteTime)soonest);
     }
-    // The work loop's view of the engines: what the interrupts gathered, in polling mode the status register itself, then deadlines.
+
     void service() {
         for (unsigned i = 0; i < 2; ++i) {
             uint32_t status = __atomic_exchange_n(&gIrqStatus[i], 0u, __ATOMIC_ACQUIRE);
@@ -225,31 +299,32 @@ class ShengBacklight : public IOService {
         }
         armTick();
     }
+
     static void inboxFired(OSObject *owner, IOInterruptEventSource *, int) {
         ShengBacklight *self = static_cast<ShengBacklight *>(owner);
         if (!self) return;
         self->service();
     }
-    // A brightness request on the work loop (setProperties arms this timer at once): the newest one asked for, if not yet taken.
     static void requestFired(OSObject *owner, IOTimerEventSource *) {
         ShengBacklight *self = static_cast<ShengBacklight *>(owner);
         if (!self) return;
         native_backlight_request[2] = native_backlight_request[2] + 1;
-        const uint64_t request = __atomic_exchange_n(&gRequest, 0ull, __ATOMIC_ACQUIRE);
-        if (request >> 63) {native_backlight_request[3] = native_backlight_request[3] + 1; self->beginFade((uint32_t)(request >> 16) & 0xffff, (uint32_t)request & 0xffff);}
+        const uint64_t req = __atomic_exchange_n(&gRequest, 0ull, __ATOMIC_ACQUIRE);
+        if (req >> 63) {
+            native_backlight_request[3] = native_backlight_request[3] + 1;
+            self->beginFade((uint32_t)(req >> 16) & 0xffff, (uint32_t)req & 0xffff);
+        }
     }
     static void tickFired(OSObject *owner, IOTimerEventSource *) {
         if (ShengBacklight *self = static_cast<ShengBacklight *>(owner)) self->service();
     }
-    // The lid changed (sheng_backlight_lid): the level now shown is written again through the lid, dark or back to it.
     static void lidFired(OSObject *owner, IOTimerEventSource *) {
-        ShengBacklight *self = static_cast<ShengBacklight *>(owner);   // see impersonate()
+        ShengBacklight *self = static_cast<ShengBacklight *>(owner);
         if (!self || !self->published) return;
         self->setLevel(self->level);
     }
-    // After a wake, every 20 ms until the display shows frames again (LidClamshell.h lid_backlight_wake_ready): then the level comes back.
     static void wakeFired(OSObject *owner, IOTimerEventSource *sender) {
-        ShengBacklight *self = static_cast<ShengBacklight *>(owner);   // see impersonate()
+        ShengBacklight *self = static_cast<ShengBacklight *>(owner);
         if (!self || !__atomic_load_n(&gWaking, __ATOMIC_ACQUIRE)) return;
         bool counted = false;
         const uint32_t frames = shownFrames(counted);
@@ -263,16 +338,14 @@ class ShengBacklight : public IOService {
               counted ? "" : " (no frame count)");
         if (self->published) self->setLevel(self->level);
     }
-    // Attaching the two lines, retried while the GIC driver is not up yet; the engines keep working by polling meanwhile.
     static void attachFired(OSObject *owner, IOTimerEventSource *sender) {
-        ShengBacklight *self = static_cast<ShengBacklight *>(owner);   // see impersonate()
+        ShengBacklight *self = static_cast<ShengBacklight *>(owner);
         if (!self || self->irqMode) return;
         if (!armcpu_spi_attach) {native_backlight_stats[12] = -1; return;}
         native_backlight_stats[14] = (int32_t)++self->attachTries;
         int rc = armcpu_spi_attach(32 + kSpi[0], false, seIrq, (void *)(uintptr_t)0, nullptr, nullptr);
         if (rc == kIOReturnNotReady && self->attachTries < kAttachTries) {sender->setTimeoutMS(kAttachMs); return;}
         if (!rc) rc = armcpu_spi_attach(32 + kSpi[1], false, seIrq, (void *)(uintptr_t)1, nullptr, nullptr);
-        // Engine a alone attached: its interrupts still arrive and are used; the deadline timer covers engine b only in polling mode.
         if (rc) {native_backlight_stats[12] = rc; return;}
         self->irqMode = true;
         native_backlight_stats[12] = 1;
@@ -280,9 +353,6 @@ class ShengBacklight : public IOService {
     }
 
 #if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
-    // The system sleeps (platform sleep): the work loop writes the level shown again, dark, as for the lid. It has woken: the panel stays
-    // dark until the display shows frames again (wakeFired). Returning at once with the notification's returnValue left 0 acknowledges
-    // it; the timers carry the change, so this never waits.
     static IOReturn sleepWake(void *, void *, UInt32 message, IOService *, void *, vm_size_t) {
         if (message != kIOMessageSystemWillSleep && message != kIOMessageSystemHasPoweredOn) return kIOReturnSuccess;
         if (message == kIOMessageSystemWillSleep) {
@@ -303,23 +373,32 @@ class ShengBacklight : public IOService {
         return kIOReturnSuccess;
     }
 #endif
+
     void setLevel(uint32_t value) {
-        target = lid_backlight_level(value, lid_backlight_dark(__atomic_load_n(&gLidClosed, __ATOMIC_ACQUIRE) != 0,
-                                                              __atomic_load_n(&gSystemAsleep, __ATOMIC_ACQUIRE) != 0));
+        const bool hwDark = lid_backlight_dark(__atomic_load_n(&gLidClosed, __ATOMIC_ACQUIRE) != 0,
+                                               __atomic_load_n(&gSystemAsleep, __ATOMIC_ACQUIRE) != 0);
+        targetDark = hwDark || value == 0;
+        if (value > 0) targetCode = clampLit(value);
+        engine[0].enRetries = engine[1].enRetries = 0;
         kick(0); kick(1);
         armTick();
     }
+
     static void fadeStep(OSObject *owner, IOTimerEventSource *sender) {
-        ShengBacklight *self = static_cast<ShengBacklight *>(owner);   // see impersonate()
+        ShengBacklight *self = static_cast<ShengBacklight *>(owner);
         if (!self) return;
         const uint64_t elapsed = now() - self->start;
         uint32_t next = self->to;
-        if (elapsed < self->period)
-            next = (uint32_t)((int64_t)self->from + ((int64_t)self->to - (int64_t)self->from) * (int64_t)elapsed / (int64_t)self->period);
+        if (elapsed < self->period) {
+            const uint32_t interp = (uint32_t)((int64_t)self->from + ((int64_t)self->to - (int64_t)self->from) * (int64_t)elapsed / (int64_t)self->period);
+            next = clampLit(interp);
+        } else if (self->to > 0) {
+            next = clampLit(self->to);
+        }
         if (next != self->level) {self->setLevel(next); self->level = next;}
         if (next != self->to) sender->setTimeoutMS(kStepMs);
     }
-    // On the work loop: a fade from the level now shown to goal.
+
     void beginFade(uint32_t goal, uint32_t milliseconds) {
         fade->cancelTimeout();
         from = level;
@@ -328,8 +407,9 @@ class ShengBacklight : public IOService {
         nanoseconds_to_absolutetime((uint64_t)milliseconds * NSEC_PER_MSEC, &period);
         fadeStep(this, fade);
     }
+
     static IOReturn begin(OSObject *owner, void *, void *, void *, void *) {
-        ShengBacklight *self = static_cast<ShengBacklight *>(owner);   // see impersonate()
+        ShengBacklight *self = static_cast<ShengBacklight *>(owner);
         if (!self) return kIOReturnBadArgument;
         self->kick(0); self->kick(1);
         if (!self->published && self->engine[0].started && self->engine[1].started) self->publishFirst();
@@ -337,33 +417,31 @@ class ShengBacklight : public IOService {
         self->attachTimer->setTimeoutMS(1);
         return kIOReturnSuccess;
     }
+
     void publish(uint32_t value) {
+        const uint32_t reportedCode = value == 0 ? 0 : clampLit(value);
+        const uint32_t currentNitsMilli = shengbacklight::milliNitsForCode((uint16_t)reportedCode, exponential);
         OSDictionary *brightness = OSDictionary::withCapacity(3), *milliNits = OSDictionary::withCapacity(3), *parameters = OSDictionary::withCapacity(2);
-        OSNumber *min = OSNumber::withNumber(0ULL, 32), *max = OSNumber::withNumber(kMaxLevel, 32), *current = OSNumber::withNumber(value, 32);
+        OSNumber *min = OSNumber::withNumber((uint64_t)kFloorCode, 32), *max = OSNumber::withNumber(kMaxLevel, 32), *current = OSNumber::withNumber(reportedCode, 32);
         OSNumber *minMilli = OSNumber::withNumber(kMinNits * 1000ULL, 32), *maxMilli = OSNumber::withNumber(kMaxNits * 1000ULL, 32);
-        OSNumber *currentMilli = OSNumber::withNumber((uint64_t)value * kMaxNits * 1000 / kMaxLevel, 32);
+        OSNumber *currentMilli = OSNumber::withNumber(currentNitsMilli, 32);
         if (brightness && milliNits && parameters && min && max && current && minMilli && maxMilli && currentMilli) {
             brightness->setObject("min", min); brightness->setObject("max", max); brightness->setObject("value", current);
             milliNits->setObject("min", minMilli); milliNits->setObject("max", maxMilli); milliNits->setObject("value", currentMilli);
             parameters->setObject("brightness", brightness);
-            // BrightnessControl takes the nits range and the current nits from here on iPadOS 27.
             parameters->setObject("BrightnessMilliNits", milliNits);
             setProperty("IODisplayParameters", parameters);
         }
         OSSafeReleaseNULL(min); OSSafeReleaseNULL(max); OSSafeReleaseNULL(current); OSSafeReleaseNULL(minMilli); OSSafeReleaseNULL(maxMilli);
         OSSafeReleaseNULL(currentMilli); OSSafeReleaseNULL(brightness); OSSafeReleaseNULL(milliNits); OSSafeReleaseNULL(parameters);
     }
-    // CoreBrightness's Display.m fails without a marketing table (equally spaced slider samples, signed 16.16 nits), and without calibration
-    // parameters it reads that table before loading it. Both describe the same range as BrightnessMilliNits. BrightnessControl takes the
-    // product luminances from their own properties, not from the calibration dictionary: at zero the table rescales to infinity and every
-    // slider position means the maximum.
+
     void publishCalibration() {
         const int32_t table[] = {(int32_t)(kMinNits << 16), (int32_t)(kMidNits << 16), (int32_t)(kMaxNits << 16)};
         if (OSData *marketing = OSData::withBytes(table, sizeof table)) {
             setProperty("backlight-marketing-table", marketing);
             marketing->release();
         }
-        // LmaxProduct is read as 4 bytes of 16.16. LmidProduct and LminProduct take a number as it is; as data they would be read as a float.
         if (OSData *value = OSData::withBytes(&table[2], sizeof table[2])) {
             setProperty("LmaxProduct", value);
             value->release();
@@ -377,8 +455,10 @@ class ShengBacklight : public IOService {
         }
         OSDictionary *calibration = OSDictionary::withCapacity(6);
         if (!calibration) return;
-        const struct {const char *key; uint32_t nits;} fields[] = {{"lMinProduct", kMinNits}, {"lMidProduct", kMidNits}, {"lMaxProduct", kMaxNits},
-                                                                   {"lMinPanel", kMinNits}, {"lMidPanel", kMidNits}, {"lMaxPanel", kMaxNits}};
+        const struct {const char *key; uint32_t nits;} fields[] = {
+            {"lMinProduct", kMinNits}, {"lMidProduct", kMidNits}, {"lMaxProduct", kMaxNits},
+            {"lMinPanel", kMinNits}, {"lMidPanel", kMidNits}, {"lMaxPanel", kMaxNits}
+        };
         for (const auto &field : fields) {
             if (OSNumber *number = OSNumber::withNumber((uint64_t)field.nits << 16, 32)) {
                 calibration->setObject(field.key, number);
@@ -388,13 +468,7 @@ class ShengBacklight : public IOService {
         setProperty("backlight-calibration-parameters", calibration);
         calibration->release();
     }
-    // The service presents itself as AppleARMBacklight (AppleARMPlatform's class, loaded but without a device on this board): its
-    // vtable is copied and getMetaClass (slot 7) answers that metaclass. IOObjectConformsTo and the sandbox both go through it: the
-    // sandbox decides iokit-set-properties by walking getMetaClass's superclass chain by name, and backboardd's profile lets it set
-    // the brightness keys on AppleARMBacklight only (int-275: "deny iokit-set-properties iokit-class:ShengBacklight property:FadePeriod").
-    // AppleARMBacklight and IOService stay in that chain, so OSDynamicCast to IOService works; to ShengBacklight it does not, which is
-    // why the event source actions cast statically. No loaded kext looks this class up (AppleSPU, AppleEmbeddedLightSensor and
-    // AppleM68Buttons do, and are not part of this kernel), and the service is never freed.
+
     static inline const OSMetaClass *gAppleClass = nullptr;
     static inline bool gImpersonating = false;
     static const OSMetaClass *appleMetaClass(const OSMetaClassBase *) {return gAppleClass;}
@@ -405,8 +479,6 @@ class ShengBacklight : public IOService {
         OSSafeReleaseNULL(name);
         if (!gAppleClass) return false;
 #if __has_feature(ptrauth_calls)
-        // arm64e: the vtable pointer and its entries are signed, so a copied vtable would not authenticate. getMetaClass itself
-        // answers the AppleARMBacklight metaclass once this flag is set (its definition below the class).
         __atomic_store_n(&gImpersonating, true, __ATOMIC_RELEASE);
         return true;
 #endif
@@ -418,21 +490,24 @@ class ShengBacklight : public IOService {
         *reinterpret_cast<uintptr_t **>(this) = copy;
         return true;
     }
-    // Both engines answered (or gave up) the level read: publish what the panel shows now and let CoreBrightness find the service.
+
     void publishFirst() {
         published = true;
+        const Engine &a = engine[0], &b = engine[1];
+        if (a.cfg1Valid) exponential = shengbacklight::isExponential(a.cfg1);
+        else if (b.cfg1Valid) exponential = shengbacklight::isExponential(b.cfg1);
+        else exponential = true;
+        __atomic_store_n(&gExponential, exponential ? 1u : 0u, __ATOMIC_RELEASE);
         const int32_t read = native_backlight_stats[3] > 0 ? native_backlight_stats[3] : native_backlight_stats[4];
-        level = to = target = read > 0 ? (uint32_t)read : kMaxLevel / 2;
-        // CoreBrightness finds the backlight by backlight-control = true and takes it for the built-in display's only when
-        // IOObjectConformsTo(service, "AppleARMBacklight") holds (CBDisplayContaineriOS findBacklight). Only for the built-in display
-        // does CoreBrightness start the libEDR server (com.apple.libEDR.Notification) that QuartzCore's IOMFBServer sends to
-        // synchronously once backlight-control makes CADeviceHasBacklight true. int-236 published backlight-control without the
-        // conformance: the server never started, the send blocked with the display server lock held and the screen stopped updating.
-        // backlight-control=0 leaves both out.
+        const uint32_t initial = read > 0 ? clampLit((uint32_t)read) : shengbacklight::codeForNits(shengbacklight::kMidFixed, exponential);
+        level = to = targetCode = initial;
+        targetDark = false;
+        IOLog("sheng backlight: survey a(id=0x%02x cfg1=0x%02x en=0x%02x code=%d) b(id=0x%02x cfg1=0x%02x en=0x%02x code=%d) mode=%s initial=%u\n",
+              a.id, a.cfg1, a.foundEn, native_backlight_stats[3],
+              b.id, b.cfg1, b.foundEn, native_backlight_stats[4],
+              exponential ? "exponential" : "linear", initial);
         uint32_t control = 1;
         PE_parse_boot_argn("backlight-control", &control, sizeof control);
-        // backboardd's sandbox profile refuses FadePeriod on this service (int-276), and CoreBrightness sends it with every brightness:
-        // the grant (patches/xnu/zzwb-native-sandbox-grant-set-properties.patch) lets backboardd/WindowServer/corebrightnessd set its properties.
         if (control == 1 && impersonate()) {
             static const uint8_t kForceOverride = 1;
             if (OSData *force = OSData::withBytes(&kForceOverride, sizeof kForceOverride)) {
@@ -449,9 +524,9 @@ class ShengBacklight : public IOService {
         __atomic_store_n(&gBacklight, this, __ATOMIC_RELEASE);
         registerService();
         native_backlight_stats[0] = impersonated ? 4 : 3;
-        // A lid closed before the service was up: the panel goes dark now, with the level read kept as the one shown.
         if (__atomic_load_n(&gLidClosed, __ATOMIC_ACQUIRE)) setLevel(level);
     }
+
 public:
     bool startBacklight(const bool usable[2]) {
         loop = IOWorkLoop::workLoop();
@@ -477,6 +552,8 @@ public:
             native_backlight_stats[7 + i] = (int32_t)config;
             engine[i].started = !engine[i].usable;
             engine[i].written = -1;
+            engine[i].lit = true;
+            engine[i].foundEn = 0x7f;
             if (!engine[i].usable) native_backlight_stats[3 + i] = -1;
         }
         if (!engine[0].usable && !engine[1].usable) return false;
@@ -485,46 +562,37 @@ public:
         loop->runAction(&ShengBacklight::begin, this);
         return true;
     }
-    // Level for signed 16.16 nits, proportional as the LED current is; a lit panel never rounds down to off.
+
     static uint32_t levelForNits(int32_t fixed) {
-        if (fixed <= 0) return 0;
-        const uint64_t scale = (uint64_t)kMaxNits << 16;
-        const uint64_t scaled = ((uint64_t)fixed * kMaxLevel + scale / 2) / scale;
-        return scaled < 1 ? 1 : scaled > kMaxLevel ? kMaxLevel : (uint32_t)scaled;
+        return shengbacklight::codeForNits(fixed, __atomic_load_n(&gExponential, __ATOMIC_ACQUIRE) != 0);
     }
+
     static uint32_t steppedLevel(uint32_t current, int delta) {
-        static constexpr uint32_t kSteps[] = {64, 96, 136, 184, 244, 316, 404, 512, 640, 792, 972, 1184, 1432, 1620, 1824, kMaxLevel};
-        constexpr int kCount = (int)(sizeof kSteps / sizeof kSteps[0]);
-        int nearest = 0;
-        uint32_t bestDiff = current > kSteps[0] ? current - kSteps[0] : kSteps[0] - current;
-        for (int i = 1; i < kCount; ++i) {
-            const uint32_t d = current > kSteps[i] ? current - kSteps[i] : kSteps[i] - current;
-            if (d < bestDiff) {bestDiff = d; nearest = i;}
-        }
-        int idx = nearest + delta;
-        if (idx < 0) idx = 0;
-        if (idx >= kCount) idx = kCount - 1;
-        return kSteps[idx];
+        shengbacklight::Steps steps;
+        steps.build(kFloorCode, __atomic_load_n(&gExponential, __ATOMIC_ACQUIRE) != 0, kMaxLevel);
+        uint16_t code = (uint16_t)clampLit(current);
+        const int limited = delta < -32 ? -32 : delta > 32 ? 32 : delta;
+        for (int i = 0; i < limited; ++i) code = steps.up(code);
+        for (int i = 0; i > limited; --i) code = steps.down(code);
+        return code;
     }
+
     void queueLevel(uint32_t goal, uint32_t milliseconds) {
         if (goal > kMaxLevel) goal = kMaxLevel;
+        if (goal > 0 && goal < kFloorCode) goal = kFloorCode;
         if (milliseconds > 5000) milliseconds = 5000;
         __atomic_store_n(&gLastLevel, goal, __ATOMIC_RELEASE);
         bump(1);
         native_backlight_request[0] = (int32_t)goal;
         native_backlight_request[1] = (int32_t)milliseconds;
-        // Handed to the work loop without waiting for it (a runAction here blocks backboardd's brightness thread on the work loop's
-        // gate; int-277 got 53 requests in the first 41 s and none after): a newer request replaces one not yet taken. The request timer, not
-        // the interrupt source, carries it: int-278 signalled the interrupt source for 345 requests and wrote none.
         __atomic_store_n(&gRequest, 1ull << 63 | (uint64_t)goal << 16 | milliseconds, __ATOMIC_RELEASE);
         request->setTimeoutUS(1);
         publish(goal);
     }
+
     IOReturn setProperties(OSObject *properties) override {
         OSDictionary *dictionary = OSDynamicCast(OSDictionary, properties);
         if (!dictionary) return kIOReturnBadArgument;
-        // iPadOS/macOS 27 sends signed 16.16 nits and ramps them itself (zero or less is the display going dark); older CoreBrightness
-        // sends a level and a fade period in 16.16 seconds.
         uint32_t goal;
         uint64_t milliseconds = 0;
         const char *source = nullptr;
@@ -535,7 +603,7 @@ public:
         } else if (OSNumber *brightness = OSDynamicCast(OSNumber, dictionary->getObject("brightness"))) {
             OSNumber *fadePeriod = OSDynamicCast(OSNumber, dictionary->getObject("FadePeriod"));
             const int32_t requested = (int32_t)brightness->unsigned32BitValue();
-            goal = requested < 0 ? 0 : (uint32_t)requested > kMaxLevel ? kMaxLevel : (uint32_t)requested;
+            goal = requested <= 0 ? 0 : clampLit((uint32_t)requested);
             milliseconds = fadePeriod ? ((uint64_t)fadePeriod->unsigned32BitValue() * 1000) >> 16 : 0;
             source = "brightness";
             __atomic_store_n(&gDirectSetProps, 1u, __ATOMIC_RELEASE);
@@ -555,7 +623,6 @@ public:
     }
 };
 #if __has_feature(ptrauth_calls)
-// OSDefineMetaClassAndStructors(ShengBacklight, IOService) with getMetaClass answering the AppleARMBacklight metaclass after impersonate().
 ShengBacklight::MetaClass ShengBacklight::gMetaClass;
 const OSMetaClass * const ShengBacklight::metaClass = &ShengBacklight::gMetaClass;
 const OSMetaClass * const ShengBacklight::superClass = &IOService::gMetaClass;
@@ -571,15 +638,12 @@ OSDefineDefaultStructors(ShengBacklight, IOService)
 OSDefineMetaClassAndStructors(ShengBacklight, IOService)
 #endif
 
-// The keyboard cover's lid (KeyboardProbe.cpp publishLid, macOS): closed, the panel goes dark; open, it shows the level asked for again.
-// Called from the keyboard thread; the work loop applies it (a timer carries it, as setProperties does a brightness), so this never waits.
 extern "C" void sheng_backlight_lid(bool closed) {
     __atomic_store_n(&gLidClosed, closed ? 1u : 0u, __ATOMIC_RELEASE);
     IOLog("sheng backlight: lid %s, panel %s\n", closed ? "closed" : "open", closed ? "dark" : "back to its level");
     if (IOTimerEventSource *timer = gLidTimer) timer->setTimeoutUS(1);
 }
 
-// Swap-path brightness adapter (GopFramebuffer NativeLegacyDisplay swap_submit): used when CoreBrightness did not call setProperties directly.
 extern "C" void sheng_backlight_set_nits(int32_t fixed) {
     if (fixed <= 0 || __atomic_load_n(&gDirectSetProps, __ATOMIC_ACQUIRE)) return;
     ShengBacklight *bl = __atomic_load_n(&gBacklight, __ATOMIC_ACQUIRE);
@@ -590,7 +654,6 @@ extern "C" void sheng_backlight_set_nits(int32_t fixed) {
     bl->queueLevel(goal, 0);
 }
 
-// Kernel-side brightness key step (KeyboardProbe.cpp): steps along the perceptual 16-level table.
 extern "C" void sheng_backlight_step(int delta) {
     if (!delta || __atomic_load_n(&gDirectSetProps, __ATOMIC_ACQUIRE) || __atomic_load_n(&gSwapNitsActive, __ATOMIC_ACQUIRE)) return;
     ShengBacklight *bl = __atomic_load_n(&gBacklight, __ATOMIC_ACQUIRE);
@@ -599,15 +662,11 @@ extern "C" void sheng_backlight_step(int delta) {
     bl->queueLevel(ShengBacklight::steppedLevel(cur, delta), 60);
 }
 
-// Called by BacklightProbe.cpp once this file's classes are registered (its static initializer runs between preModLoad and postModLoad).
-// The service starts with the engines' level reads in flight and publishes itself when they are answered.
 extern "C" void sheng_backlight_start(void) {
     if (!mapWindow(gGcc, kGcc, 0x60000) || !mapWindow(gSe[0], kSeA, 0x4000) || !mapWindow(gSe[1], kSeB, 0x4000)) {fail(1, -12); return;}
     native_backlight_stats[0] = 1;
     wr(gGcc.va, kGccVote, rd(gGcc.va, kGccVote) | kVoteBits);
     for (uint32_t halt : kHalt) {
-        // The AHB branches run under hardware clock gating (HW_CTL, bit 1 of the branch register): their CLK_OFF bit says off while the
-        // bus is idle, so, as clk-branch.c does in that mode, they are not waited for (int-231 failed here on wrap 1 s_ahb, 0x23280).
         if (rd(gGcc.va, halt) & (1u << 1)) continue;
         unsigned us = 0;
         while ((rd(gGcc.va, halt) & (1u << 31)) && us < 200) {IODelay(1); ++us;}

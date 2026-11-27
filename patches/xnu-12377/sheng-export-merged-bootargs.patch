@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] sheng: kern.piano_bootargs sysctl exposing full bootloader + builtin boot-args
+
+Ported from Pad 8 Pro (0076-export-merged-boot-args.patch), adapted to UniXNU where
+PE_builtin_boot_args lives separately from PE_boot_args() and kern.bootargs keeps the
+bootloader command line clipped to BOOT_LINE_LENGTH.
+
+---
+diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
+index 7c37792..80ed1a3 100644
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -2282,6 +2282,44 @@ SYSCTL_PROC(_kern, OID_AUTO, bootargs,
+     NULL, 0,
+     sysctl_sysctl_bootargs, "A", "bootargs");
+ 
++#if defined(__arm64__)
++extern char PE_builtin_boot_args[] __attribute__((weak_import));
++/* Ported from Pad 8 Pro (0076): full merged boot-args (bootloader line + PE_builtin_boot_args)
++ * without truncating kern.bootargs's fixed 1024-byte contract. */
++STATIC int
++sysctl_piano_bootargs
++(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char *cmd = PE_boot_args();
++	const char *builtin = (&PE_builtin_boot_args != NULL) ? PE_builtin_boot_args : NULL;
++	if (!builtin || !builtin[0]) {
++		char empty[] = "";
++		return sysctl_io_string(req, cmd ? cmd : empty, 0, 0, NULL);
++	}
++	const size_t cmd_len = cmd ? strlen(cmd) : 0;
++	const size_t builtin_len = strlen(builtin);
++	const size_t need = cmd_len + (cmd_len ? 1 : 0) + builtin_len + 1;
++	const size_t cap = need < 4096 ? need : 4096;
++	char *buf = (char *)kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (!buf) {
++		return ENOMEM;
++	}
++	if (cmd_len) {
++		strlcpy(buf, cmd, cap);
++		strlcat(buf, " ", cap);
++	}
++	strlcat(buf, builtin, cap);
++	int err = sysctl_io_string(req, buf, 0, 0, NULL);
++	kfree_data(buf, cap);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, piano_bootargs,
++    CTLFLAG_LOCKED | CTLFLAG_RD | CTLFLAG_KERN | CTLTYPE_STRING,
++    NULL, 0,
++    sysctl_piano_bootargs, "A", "Merged boot arguments (bootloader + builtin)");
++#endif
++
+ STATIC int
+ sysctl_kernelcacheuuid(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+ {

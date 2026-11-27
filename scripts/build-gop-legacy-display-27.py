@@ -875,7 +875,13 @@ if MACOS:
     run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func', '--globalize-symbol=__GLOBAL__sub_I_NativeAES.cpp',
          AES_OUT / 'NativeAES.o', aes_late])
     compile_cpp(KITS / 'SoftwareAesProbe.cpp', AES_OUT / 'SoftwareAesProbe.o', ())
-    input_objects += [aes_late, AES_OUT / 'aes-bindings.o', AES_OUT / 'aes-addresses.o', AES_OUT / 'SoftwareAesProbe.o']
+    compile_cpp(KITS / 'DiagnosticDataStandIn.cpp', AES_OUT / 'DiagnosticDataStandIn.o', ())
+    diag_late = AES_OUT / 'DiagnosticDataStandIn.late.o'
+    run([llvm / 'llvm-objcopy', '--remove-section=__DATA,__mod_init_func',
+         '--globalize-symbol=__GLOBAL__sub_I_DiagnosticDataStandIn.cpp',
+         AES_OUT / 'DiagnosticDataStandIn.o', diag_late])
+    input_objects += [aes_late, AES_OUT / 'aes-bindings.o', AES_OUT / 'aes-addresses.o',
+                      AES_OUT / 'SoftwareAesProbe.o', diag_late]
     print(f'AES: {len(aes_used)} original bindings, {aes_vt} matches the original {len(aes_slots)} diversities')
 print(f'Board drivers: {len(board_objects)} objects')
 archive = OUT / 'libNativeLegacyDisplay.late.a'
@@ -899,7 +905,7 @@ sources += [Path(name) for name in json.loads((IRIS_OUT / 'c/report.json').read_
 for directory in ('include', 'kernel', 'src', 'shim'):
     sources += sorted((IRIS / directory).rglob('*.h')) + sorted((IRIS / directory).glob('*.cpp'))
 sources += [KITS / name for name in ('SmmuBypass.h', 'AppsSmmuLock.h', 'UsbProbe.cpp')]
-sources += [KITS / name for name in ('KeyboardCover.cpp', 'KeyboardProbe.cpp', 'KeyboardService.h', 'KeyboardTrace.h', 'TouchLid.h', 'LidClamshell.h', 'ShengSleep.cpp', 'ShengSleep.h', 'Wn8030.c', 'Wn8030.h', 'GeniI2c.c', 'GeniI2c.h')]
+sources += [KITS / name for name in ('KeyboardCover.cpp', 'KeyboardProbe.cpp', 'KeyboardService.h', 'KeyboardTrace.h', 'PianoWn8030.h', 'TouchLid.h', 'LidClamshell.h', 'ShengSleep.cpp', 'ShengSleep.h', 'Wn8030.c', 'Wn8030.h', 'GeniI2c.c', 'GeniI2c.h', 'AppleARMBacklight.cpp', 'BacklightProbe.cpp', 'PianoAndroidBrightness.h', 'ShengBacklightCurve.h', 'PianoDiskIdentity.h', 'DiagnosticDataStandIn.cpp', 'SoftwareAesProbe.cpp')]
 sources += [keyboard_firmware]
 sources += [USB / 'QcomDwc3.cpp', USB / 'QcomEusb2Phy.h', USB / 'QcomQmpUsb3.h', USB / 'QcomUcsi.h', ROOT / f'scripts/usb-xdci-{BUILD}.json', ROOT / f'scripts/usb-xhci-{BUILD}.json']
 

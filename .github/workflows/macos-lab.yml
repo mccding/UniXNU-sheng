@@ -198,6 +198,7 @@ jobs:
           for name in (
               'turnip-darwin-idle-trim-reclaim.patch',
               'turnip-darwin-cs-reserve.patch',
+              'turnip-darwin-sysmem-feedback-flush.patch',
           ):
               src_text = (Path('device/patches/adreno-mesa') / name).read_text().replace('\r\n', '\n')
               (mesa_dir / name).write_text(src_text, newline='\n')
@@ -281,8 +282,20 @@ jobs:
           assert rc_old in rc_src, 'missing hostQueryRead in RootCommands.h'
           rc.write_text(rc_src.replace(rc_old, rc_new, 1))
 
+          disk_id_text = Path('device/package/PianoDiskIdentity.h').read_text()
+          Path('device/drivers/ShengUfs/PianoDiskIdentity.h').write_text(disk_id_text)
+          Path('UniXNU/drivers/RamBlock/PianoDiskIdentity.h').write_text(disk_id_text)
+
           nu = Path('device/drivers/ShengUfs/NativeUfs.cpp')
           nu_src = nu.read_text()
+          nu_inc_old = '#include <IOKit/IOLib.h>'
+          nu_inc_new = '#include <IOKit/IOLib.h>\n#include "PianoDiskIdentity.h"'
+          assert nu_inc_old in nu_src, 'missing IOLib.h include in NativeUfs.cpp'
+          nu_src = nu_src.replace(nu_inc_old, nu_inc_new, 1)
+          nu_vendor_old = '  char *getVendorString () override { return const_cast<char *> ("Native"); }'
+          nu_vendor_new = '  char *getVendorString () override { return const_cast<char *> (pianodisk::enabled () ? pianodisk::kVendor : "Native"); }'
+          assert nu_vendor_old in nu_src, 'missing getVendorString in NativeUfs.cpp'
+          nu_src = nu_src.replace(nu_vendor_old, nu_vendor_new, 1)
           nu_state_old = '\n'.join([
               '  *why = "LUN 0 not ready";',
               '  return false;',
@@ -355,6 +368,7 @@ jobs:
               '    setProperty ("IOMaximumByteCountRead", static_cast<unsigned long long> (maxIoKiB) * 1024ULL, 64);',
               '    setProperty ("IOMaximumBlockCountRead", static_cast<unsigned long long> (maxIoKiB) * 2ULL, 64);',
               '  }',
+              '  pianodisk::publish (this, label, "1.0");',
               '  online = true;',
               '  registerService ();',
           ])
@@ -382,6 +396,14 @@ jobs:
 
           rb = Path('UniXNU/drivers/RamBlock/NativeRamBlock.cpp')
           rb_src = rb.read_text()
+          rb_inc_old = '#include "DirectDisk.h"'
+          rb_inc_new = '#include "DirectDisk.h"\n#include "PianoDiskIdentity.h"'
+          assert rb_inc_old in rb_src, 'missing DirectDisk.h include in NativeRamBlock.cpp'
+          rb_src = rb_src.replace(rb_inc_old, rb_inc_new, 1)
+          rb_vendor_old = '  char *getVendorString() override { return const_cast<char *>("Native"); }\n  char *getProductString() override { return const_cast<char *>("Owned RAM block storage"); }'
+          rb_vendor_new = '  char *getVendorString() override { return const_cast<char *>(pianodisk::enabled() ? pianodisk::kVendor : "Native"); }\n  char *getProductString() override { return const_cast<char *>(pianodisk::enabled() ? "UFS Data" : "Owned RAM block storage"); }'
+          assert rb_vendor_old in rb_src, 'missing vendor/product getters in NativeRamBlock.cpp'
+          rb_src = rb_src.replace(rb_vendor_old, rb_vendor_new, 1)
           rb_stage_old = '  static constexpr uint32_t kStagePages = 32;'
           rb_stage_new = '  static constexpr uint32_t kStagePages = 64;'
           assert rb_stage_old in rb_src, 'missing kStagePages in NativeRamBlock.cpp'
@@ -392,6 +414,7 @@ jobs:
               '  setProperty("IOMaximumByteCountWrite", 1048576ULL, 64);',
               '  setProperty("IOMaximumBlockCountRead", 2048ULL, 64);',
               '  setProperty("IOMaximumBlockCountWrite", 2048ULL, 64);',
+              '  pianodisk::publish(this, "UFS Data", "1.0");',
               '  online = true;',
               '  native_ram_block_ready = 1;',
               '  registerService();',
@@ -449,6 +472,37 @@ jobs:
           ])
           assert ld_swap_old in ld_src, 'missing swapSetColorMatrix in NativeLegacyDisplay.cpp'
           ld.write_text(ld_src.replace(ld_swap_old, ld_swap_new, 1))
+
+          # Fix icon-cache daemon exit code 1 by stopping iconservicesd/agent first and handling busy top dir.
+          icon_rt = Path('UniXNU/scripts/build-boot-runtime.py')
+          icon_src = icon_rt.read_text()
+          icon_old = '\n'.join([
+              '    /bin/rm -rf "$root/Library/Caches/com.apple.iconservices.store" || exit 1',
+              '    folders="$root/private/var/folders"',
+              '    if [ -d "$folders" ]; then',
+              '        /usr/bin/find -P "$folders" -mindepth 4 -maxdepth 4 \\',
+              '            \\( -path \'*/C/com.apple.iconservices\' -o -path \'*/C/com.apple.iconservices.store\' \\) \\',
+              '            -execdir /bin/rm -rf -- {} + || exit 1',
+              '    fi',
+              '    restart_icon_services || exit 1',
+          ])
+          icon_new = '\n'.join([
+              '    restart_icon_services || true',
+              '    /bin/sleep 1',
+              '    if [ -e "$root/Library/Caches/com.apple.iconservices.store" ]; then',
+              '        /bin/rm -rf "$root/Library/Caches/com.apple.iconservices.store" 2>/dev/null || \\',
+              '            /usr/bin/find "$root/Library/Caches/com.apple.iconservices.store" -mindepth 1 -maxdepth 1 -exec /bin/rm -rf -- {} + || true',
+              '    fi',
+              '    folders="$root/private/var/folders"',
+              '    if [ -d "$folders" ]; then',
+              '        /usr/bin/find -P "$folders" -mindepth 4 -maxdepth 4 \\',
+              '            \\( -path \'*/C/com.apple.iconservices\' -o -path \'*/C/com.apple.iconservices.store\' \\) \\',
+              '            -execdir /bin/rm -rf -- {} + 2>/dev/null || true',
+              '    fi',
+              '    restart_icon_services || true',
+          ])
+          assert icon_old in icon_src, 'missing ICON_CACHE_FUNCTION rm block in build-boot-runtime.py'
+          icon_rt.write_text(icon_src.replace(icon_old, icon_new, 1))
           print('Applied Stage 1, Stage 2, and Stage 3 patches.')
           PY
       - name: Refresh pinned translator checkout
@@ -502,6 +556,8 @@ jobs:
           python3 device/scripts/check-keyboard-service-host.py
           python3 device/scripts/check-keyboard-cover-host.py
           python3 device/scripts/check-lid-clamshell-host.py
+          python3 device/scripts/check-backlight-host.py
+          python3 device/scripts/check-piano-wn8030-host.py
       - name: Install build tools
         run: |
           brew install dtc llvm lld llvm@22 lld@22 cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef openssl@3 zstd blacktop/tap/ipsw

@@ -1,0 +1,100 @@
+turnip: darwin, in a sysmem pass a draw that reads the attachments it renders to waits for the earlier draws' writes
+
+Ported from Pad 8 Pro (lenzhang/UniXNU-xiaomipad8pro 0007-turnip-darwin-sysmem-feedback-flush.patch) onto Mesa 85fda3b3.
+Cleans CCU, invalidates UCHE, cleans blit cache (A7XX+), and waits for writes + idle under CP_COND_REG_EXEC on sysmem RENDER_MODE.
+TU_DEBUG=nofbflush disables it; TU_DEBUG=fbflushall also flushes on feedback-loop/rasterization-order state. MIT.
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 60ad3a8..7b8ba51 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -8301,6 +8301,51 @@ tu_flush_dynamic_input_attachments(struct tu_cmd_buffer *cmd)
+    }
+ }
+ 
++/* Ported from Pad 8 Pro (Turnip 0007): a draw that reads the attachments it renders to (Metal framebuffer fetch via
++ * input attachments: Core Animation glass/backdrop/vibrancy and RenderBox clips/shadows) reads via UCHE in sysmem
++ * while earlier pixels may still sit in CCU. Under CP_COND_REG_EXEC on sysmem RENDER_MODE, clean CCU, invalidate
++ * UCHE, clean blit cache (A7XX+), and wait for writes + idle. TU_DEBUG=nofbflush leaves it out. */
++static const char *
++tu_draw_reads_own_attachments(const struct tu_cmd_buffer *cmd)
++{
++   const struct tu_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
++   if (fs && fs->fs.dynamic_input_attachments_used)
++      return "input attachments of a dynamic pass";
++   if (fs && fs->variant && fs->variant->num_samp > 0 && cmd->state.subpass && cmd->state.subpass->input_count)
++      return "input attachments of the subpass";
++   if (!TU_DEBUG(FB_FLUSH_ALL))
++      return NULL;
++   if (cmd->state.subpass && (cmd->state.subpass->feedback_loop_color || cmd->state.subpass->feedback_loop_ds))
++      return "a subpass whose input attachment is also its colour or depth attachment (fbflushall)";
++   if (cmd->state.raster_order_attachment_access)
++      return "rasterization-order attachment access (fbflushall)";
++   if (cmd->state.pipeline_feedback_loops || cmd->vk.dynamic_graphics_state.feedback_loops)
++      return "an attachment feedback loop (fbflushall)";
++   return NULL;
++}
++
++template <chip CHIP>
++static void
++tu_sysmem_feedback_flush(struct tu_cmd_buffer *cmd, struct tu_cs *cs, const char *why)
++{
++   static bool told;
++   if (!told) {
++      told = true;
++      mesa_logi("draws that read the attachments they render to (first: %s): in a sysmem pass each waits for the colour and depth "
++                "writes before it (0007; TU_DEBUG=nofbflush leaves it out)", why);
++   }
++   tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(RENDER_MODE) | CP_COND_REG_EXEC_0_SYSMEM);
++   tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
++   tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_DEPTH);
++   tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
++   if (CHIP >= A7XX)
++      tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_BLIT_CACHE);
++   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
++   tu_cs_emit_wfi(cs);
++   tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
++   tu_cond_exec_end(cs);
++}
++
+ template <chip CHIP>
+ static VkResult
+ tu6_draw_common(struct tu_cmd_buffer *cmd,
+@@ -8360,6 +8405,11 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+ 
+    tu_emit_cache_flush_renderpass<CHIP>(cmd);
+ 
++   if (!TU_DEBUG(NO_FB_FLUSH)) {
++      if (const char *why = tu_draw_reads_own_attachments(cmd))
++         tu_sysmem_feedback_flush<CHIP>(cmd, cs, why);
++   }
++
+   if (BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                   MESA_VK_DYNAMIC_IA_PRIMITIVE_RESTART_ENABLE) ||
+       BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index 598c3dc..717db4b 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -57,6 +57,8 @@ static const struct debug_control tu_debug_options[] = {
+    { "nocb", TU_DEBUG_NO_CONCURRENT_BINNING },
+    { "forcecb", TU_DEBUG_FORCE_CONCURRENT_BINNING },
+    { "computeroundrobin", TU_DEBUG_COMPUTE_ROUND_ROBIN },
++   { "nofbflush", TU_DEBUG_NO_FB_FLUSH },
++   { "fbflushall", TU_DEBUG_FB_FLUSH_ALL },
+    { NULL, 0 }
+ };
+ 
+diff --git a/src/freedreno/vulkan/tu_util.h b/src/freedreno/vulkan/tu_util.h
+index f73c1f9..a925d73 100644
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -75,6 +75,8 @@ enum tu_debug_flags : uint64_t
+    TU_DEBUG_NO_CONCURRENT_BINNING    = BITFIELD64_BIT(35),
+    TU_DEBUG_FORCE_CONCURRENT_BINNING = BITFIELD64_BIT(36),
+    TU_DEBUG_COMPUTE_ROUND_ROBIN      = BITFIELD64_BIT(37),
++   TU_DEBUG_NO_FB_FLUSH              = BITFIELD64_BIT(38),
++   TU_DEBUG_FB_FLUSH_ALL             = BITFIELD64_BIT(39),
+ };
+ 
+ struct tu_env {
