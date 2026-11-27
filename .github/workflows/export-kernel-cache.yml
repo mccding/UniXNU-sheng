@@ -6,12 +6,39 @@ on:
       cache_key:
         type: string
         required: true
+      runtime_cache_key:
+        type: string
+        required: false
+        default: ''
+      uefi_cache_key:
+        type: string
+        required: false
+        default: ''
+      include_toolchain:
+        type: boolean
+        required: false
+        default: false
   workflow_dispatch:
     inputs:
       cache_key:
         description: Kernel cache key from a successful macOS build
         type: string
         required: true
+      runtime_cache_key:
+        description: Optional IPSW runtime cache key (for kernelcache.decompressed)
+        type: string
+        required: false
+        default: ''
+      uefi_cache_key:
+        description: Optional UEFI cache key (for SILICIUM_UEFI.fd)
+        type: string
+        required: false
+        default: ''
+      include_toolchain:
+        description: Also bundle macOS Xcode kernel toolchain binaries
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -28,18 +55,54 @@ jobs:
           key: ${{ inputs.cache_key }}
           fail-on-cache-miss: true
           path: |
+            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/xnu-inputs.json
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/xnu-work
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/fakeroot
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/xnu
+      - uses: actions/cache/restore@v4
+        if: inputs.runtime_cache_key != ''
+        with:
+          key: ${{ inputs.runtime_cache_key }}
+          fail-on-cache-miss: false
+          path: UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime-cache
+      - uses: actions/cache/restore@v4
+        if: inputs.uefi_cache_key != ''
+        with:
+          key: ${{ inputs.uefi_cache_key }}
+          fail-on-cache-miss: false
+          path: uefi-sheng/Build/shengPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd
       - name: Package build inputs
         run: |
-          tree=UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree
+          base=UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos
+          tree="$base/tree"
           mkdir export
-          tar -C "$tree" -cf - .cache/xnu-work .cache/fakeroot build/xnu | zstd -T2 -3 -o export/kernel-cache.tar.zst
+          tar -C "$base" -cf - xnu-inputs.json tree/.cache/xnu-work tree/.cache/fakeroot tree/build/xnu | zstd -T2 -3 -o export/kernel-cache.tar.zst
           sdk=$(xcrun --sdk iphoneos --show-sdk-path)
           tar -C "$sdk" -cf - . | zstd -T2 -3 -o export/iphoneos-sdk.tar.zst
+          if [ -d "$base/runtime-cache" ]; then
+            tar -C "$base/runtime-cache" -cf - . | zstd -T2 -3 -o export/runtime-cache.tar.zst
+          fi
+          uefi_fd=uefi-sheng/Build/shengPkg/DEBUG_CLANGPDB/FV/SILICIUM_UEFI.fd
+          if [ -f "$uefi_fd" ]; then
+            cp "$uefi_fd" export/SILICIUM_UEFI.fd
+          fi
           python3 - "$tree" "$sdk" <<'PY'
           import json, subprocess, sys
+          from pathlib import Path
+          compiler = Path(subprocess.check_output(['xcrun', '--find', 'clang'], text=True).strip())
+          Path('export/build-paths.json').write_text(json.dumps(dict(
+              tree=str(Path(sys.argv[1]).resolve()), sdk=sys.argv[2],
+              toolchain=str(compiler.parent.parent),
+              compiler=subprocess.check_output([str(compiler), '--version'], text=True),
+              xcode=subprocess.check_output(['xcodebuild', '-version'], text=True)), indent=2) + '\n')
+          PY
+      - name: Package macOS toolchain
+        if: inputs.include_toolchain
+        run: |
+          tree=UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          python3 - "$tree" "$sdk" <<'PY'
+          import subprocess
           from pathlib import Path
           import shutil
           tools = Path('export/toolchain/bin')
@@ -108,18 +171,11 @@ jobs:
           subprocess.run(['tar', '-C', str(tools.parent), '-cf', 'export/toolchain-linker.tar',
                           'bin/ld-classic'], check=True)
           subprocess.run(['zstd', '-T2', '-3', '--rm', 'export/toolchain-linker.tar'], check=True)
-          Path('export/build-paths.json').write_text(json.dumps(dict(
-              tree=str(Path(sys.argv[1]).resolve()), sdk=sys.argv[2],
-              toolchain=str(compiler.parent.parent),
-              compiler=subprocess.check_output([str(compiler), '--version'], text=True),
-              xcode=subprocess.check_output(['xcodebuild', '-version'], text=True)), indent=2) + '\n')
           PY
           tar -C export -cf - toolchain | zstd -T2 -3 -o export/compiler-toolchain.tar.zst
       - uses: actions/upload-artifact@v4
         with:
           name: local-kernel-build-inputs
-          path: |
-            export/*.tar.zst
-            export/build-paths.json
+          path: export/*
           retention-days: 1
           compression-level: 0
