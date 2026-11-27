@@ -101,14 +101,20 @@ jobs:
             UniXNU/out/feeds
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/gpu-reference
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/mesa-work
-            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/unixnu-mesa-patch.sha256
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/adreno-metal-bridge
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/m2v-target
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/mesa-tu-macos27
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime/data.dbr
             device/drivers/Ath12kWifi/deps
             device/.cache/firmware
-      - name: Apply Stage 1 and Stage 2 patches
+      - name: Restore pinned Data seed
+        id: data-seed-cache
+        if: ${{ !inputs.root_storage }}
+        uses: actions/cache/restore@v4
+        with:
+          key: sheng-macos27-data-seed-9A4D30E4
+          path: UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime/data.dbr
+      - name: Apply Stage 1, Stage 2, and Stage 3 patches
         run: |
           python3 - <<'PY'
           import json, shutil, subprocess
@@ -199,7 +205,251 @@ jobs:
               if rel not in pins['patches']:
                   pins['patches'].append(rel)
           pins_path.write_text(json.dumps(pins, indent=2) + '\n')
-          print('Applied Stage 1 and Stage 2 patches.')
+
+          # Stage 3 UFS WriteBooster + max I/O + NativeRamBlock staging + display swap_submit backlight hook
+          rc = Path('device/drivers/ShengUfs/RootCommands.h')
+          rc_src = rc.read_text()
+          assert 'static constexpr uint32_t kXferMax = 1U << 20' in rc_src, 'kXferMax != 1 MiB in RootCommands.h'
+          rc_old = '\n'.join([
+              '// Query read request (opcode 0x03 READ ATTRIBUTE / 0x05 READ FLAG). Returns the value field.',
+              'static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)',
+              '{',
+              '  if (!value || (opcode != 3 && opcode != 5)) return kIOReturnBadArgument;',
+              '  const UfsSlot slot = ufsSlot (0);',
+              '  if (!hostClearUcd (slot)) return kIOReturnNotReady;',
+              '  uint8_t *ucd = slot.ucd;',
+              '  ucd[0] = 0x16;                      // QUERY REQUEST',
+              '  ucd[3] = 1;',
+              '  ucd[5] = 0x01;                      // standard read request (header dword 1, byte 1)',
+              '  ucd[12] = opcode;',
+              '  ucd[13] = idn;',
+              '  uint32_t ocs = 0xf;',
+              '  IOReturn status = hostSubmit (slot, 0, 0, 200000, &ocs);',
+              '  if (status != kIOReturnSuccess) {',
+              '    return status;',
+              '  }',
+              '  status = hostResponseHeader (slot, 0x36, 0, 1);',
+              '  if (status != kIOReturnSuccess) return status;',
+              '  const uint8_t *rsp = ucd + kRspOffset;',
+              '  if (rsp[10] || rsp[11]) return hostProtocolError (4);',
+              '  if (rsp[12] != opcode || rsp[13] != idn || rsp[14] || rsp[15]) return hostProtocolError (5);',
+              '  if (rsp[6] != 0) {',
+              '    gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnError);',
+              '    return kIOReturnError;',
+              '  }',
+              '  *value = loadBe32 (rsp + 20);',
+              '  return kIOReturnSuccess;',
+              '}',
+          ])
+          rc_new = '\n'.join([
+              '// Query request (0x03 READ ATTR, 0x05 READ FLAG, 0x06 SET FLAG, 0x07 CLEAR FLAG). Returns the value field.',
+              'static IOReturn hostQuery (uint8_t opcode, uint8_t idn, uint8_t index, uint32_t *value)',
+              '{',
+              '  const bool write = opcode == 6 || opcode == 7;',
+              '  if (!value || (opcode != 3 && opcode != 5 && !write)) return kIOReturnBadArgument;',
+              '  const UfsSlot slot = ufsSlot (0);',
+              '  if (!hostClearUcd (slot)) return kIOReturnNotReady;',
+              '  uint8_t *ucd = slot.ucd;',
+              '  ucd[0] = 0x16;                      // QUERY REQUEST',
+              '  ucd[3] = 1;',
+              '  ucd[5] = write ? 0x81 : 0x01;       // standard write / read request (header dword 1, byte 1)',
+              '  ucd[12] = opcode;',
+              '  ucd[13] = idn;',
+              '  ucd[14] = index;',
+              '  uint32_t ocs = 0xf;',
+              '  IOReturn status = hostSubmit (slot, 0, 0, 200000, &ocs);',
+              '  if (status != kIOReturnSuccess) {',
+              '    return status;',
+              '  }',
+              '  status = hostResponseHeader (slot, 0x36, 0, 1);',
+              '  if (status != kIOReturnSuccess) return status;',
+              '  const uint8_t *rsp = ucd + kRspOffset;',
+              '  if (rsp[10] || rsp[11]) return hostProtocolError (4);',
+              '  if (rsp[12] != opcode || rsp[13] != idn || rsp[14] != index || rsp[15]) return hostProtocolError (5);',
+              '  if (rsp[6] != 0) {',
+              '    gRootDiagnostic.result = static_cast<uint32_t> (kIOReturnError);',
+              '    return kIOReturnError;',
+              '  }',
+              '  *value = loadBe32 (rsp + 20);',
+              '  return kIOReturnSuccess;',
+              '}',
+              'static IOReturn hostQueryRead (uint8_t opcode, uint8_t idn, uint32_t *value)',
+              '{',
+              '  return hostQuery (opcode, idn, 0, value);',
+              '}',
+          ])
+          assert rc_old in rc_src, 'missing hostQueryRead in RootCommands.h'
+          rc.write_text(rc_src.replace(rc_old, rc_new, 1))
+
+          nu = Path('device/drivers/ShengUfs/NativeUfs.cpp')
+          nu_src = nu.read_text()
+          nu_state_old = '\n'.join([
+              '  *why = "LUN 0 not ready";',
+              '  return false;',
+              '}',
+              '}',
+              '',
+              'namespace {',
+              'static uint32_t be32w (const uint8_t *at)',
+          ])
+          nu_state_new = '\n'.join([
+              '  *why = "LUN 0 not ready";',
+              '  return false;',
+              '}',
+              '',
+              'struct UfsDeviceState {',
+              '  uint32_t value[10];',
+              '  uint32_t failed = 0;',
+              '  bool wbRequested = false;',
+              '  uint32_t wbBefore[3] = { 0xffffffffU, 0xffffffffU, 0xffffffffU };',
+              '  uint32_t wbAfter[3] = { 0xffffffffU, 0xffffffffU, 0xffffffffU };',
+              '  unsigned wbSets = 0, wbSetFailures = 0;',
+              '  bool stoppedPoisoned = false;',
+              '};',
+              'struct UfsStateRead { uint8_t opcode, idn; };',
+              'static constexpr UfsStateRead kStateReads[10] = {',
+              '  { 0x03, 0x02 }, { 0x03, 0x03 }, { 0x05, 0x0e }, { 0x05, 0x0f }, { 0x05, 0x10 },',
+              '  { 0x03, 0x1d }, { 0x03, 0x1f }, { 0x03, 0x1e }, { 0x03, 0x1c }, { 0x03, 0x05 },',
+              '};',
+              'static constexpr uint8_t kWbFlags[3] = { 0x0e, 0x10, 0x0f };',
+              'static constexpr unsigned kWbRead[3] = { 2, 4, 3 };',
+              'static void hostDeviceState (bool enableWb, UfsDeviceState *s)',
+              '{',
+              '  *s = UfsDeviceState {};',
+              '  s->wbRequested = enableWb;',
+              '  for (unsigned i = 0; i < 10; ++i) {',
+              '    s->value[i] = 0xffffffffU;',
+              '    if (gHost.poisoned) { s->stoppedPoisoned = true; s->failed |= 1U << i; continue; }',
+              '    uint32_t v = 0;',
+              '    if (hostQuery (kStateReads[i].opcode, kStateReads[i].idn, 0, &v) == kIOReturnSuccess) s->value[i] = v;',
+              '    else s->failed |= 1U << i;',
+              '  }',
+              '  for (unsigned k = 0; k < 3; ++k) s->wbBefore[k] = s->wbAfter[k] = s->value[kWbRead[k]];',
+              '  if (!enableWb) return;',
+              '  for (unsigned k = 0; k < 3; ++k) {',
+              '    if (gHost.poisoned) { s->stoppedPoisoned = true; return; }',
+              '    if (s->wbBefore[k] == 1) continue;',
+              '    uint32_t v = 0;',
+              '    ++s->wbSets;',
+              '    if (hostQuery (0x06, kWbFlags[k], 0, &v) != kIOReturnSuccess) { ++s->wbSetFailures; continue; }',
+              '    if (gHost.poisoned) { s->stoppedPoisoned = true; return; }',
+              '    uint32_t back = 0xffffffffU;',
+              '    if (hostQuery (0x05, kWbFlags[k], 0, &back) == kIOReturnSuccess) s->wbAfter[k] = back;',
+              '  }',
+              '}',
+              '}',
+              '',
+              'namespace {',
+              'static uint32_t be32w (const uint8_t *at)',
+          ])
+          assert nu_state_old in nu_src, 'missing hostBringUp tail in NativeUfs.cpp'
+          nu_src = nu_src.replace(nu_state_old, nu_state_new, 1)
+
+          nu_maxio_old = '  online = true;\n  registerService ();'
+          nu_maxio_new = '\n'.join([
+              '  {',
+              '    uint32_t maxIoKiB = 1024;',
+              '    PE_parse_boot_argn ("native-ufs-maxio", &maxIoKiB, sizeof maxIoKiB);',
+              '    if (maxIoKiB < 64) maxIoKiB = 64;',
+              '    if (maxIoKiB > 1024) maxIoKiB = 1024;',
+              '    setProperty ("IOMaximumByteCountRead", static_cast<unsigned long long> (maxIoKiB) * 1024ULL, 64);',
+              '    setProperty ("IOMaximumBlockCountRead", static_cast<unsigned long long> (maxIoKiB) * 2ULL, 64);',
+              '  }',
+              '  online = true;',
+              '  registerService ();',
+          ])
+          assert nu_maxio_old in nu_src, 'missing NativeUfsBlock::start tail in NativeUfs.cpp'
+          nu_src = nu_src.replace(nu_maxio_old, nu_maxio_new, 1)
+
+          nu_root_old = '  native_ufs_root_step = 2;\n  RootLayout *layout'
+          nu_root_new = '\n'.join([
+              '  native_ufs_root_step = 2;',
+              '  {',
+              '    uint32_t wbArg = 0;',
+              '    const bool wantWb = PE_parse_boot_argn ("native-ufs-wb", &wbArg, sizeof wbArg) && wbArg == 1;',
+              '    UfsDeviceState devState;',
+              '    hostDeviceState (wantWb, &devState);',
+              '    IOLog ("NativeUfs: ufs-state: power=0x%x icc=0x%x wb=%u->%u flush=%u->%u h8=%u->%u avail=%u size=%u life=0x%x fstat=%u bkops=%u sets=%u fail=%u poisoned=%u\\n",',
+              '           devState.value[0], devState.value[1], devState.wbBefore[0], devState.wbAfter[0],',
+              '           devState.wbBefore[2], devState.wbAfter[2], devState.wbBefore[1], devState.wbAfter[1],',
+              '           devState.value[5], devState.value[6], devState.value[7], devState.value[8], devState.value[9],',
+              '           devState.wbSets, devState.wbSetFailures, devState.stoppedPoisoned ? 1U : 0U);',
+              '  }',
+              '  RootLayout *layout',
+          ])
+          assert nu_root_old in nu_src, 'missing startRoot anchor in NativeUfs.cpp'
+          nu.write_text(nu_src.replace(nu_root_old, nu_root_new, 1))
+
+          rb = Path('UniXNU/drivers/RamBlock/NativeRamBlock.cpp')
+          rb_src = rb.read_text()
+          rb_stage_old = '  static constexpr uint32_t kStagePages = 32;'
+          rb_stage_new = '  static constexpr uint32_t kStagePages = 64;'
+          assert rb_stage_old in rb_src, 'missing kStagePages in NativeRamBlock.cpp'
+          rb_src = rb_src.replace(rb_stage_old, rb_stage_new, 1)
+          rb_start_old = '  online = true;\n  native_ram_block_ready = 1;\n  registerService();'
+          rb_start_new = '\n'.join([
+              '  setProperty("IOMaximumByteCountRead", 1048576ULL, 64);',
+              '  setProperty("IOMaximumByteCountWrite", 1048576ULL, 64);',
+              '  setProperty("IOMaximumBlockCountRead", 2048ULL, 64);',
+              '  setProperty("IOMaximumBlockCountWrite", 2048ULL, 64);',
+              '  online = true;',
+              '  native_ram_block_ready = 1;',
+              '  registerService();',
+          ])
+          assert rb_start_old in rb_src, 'missing start() tail in NativeRamBlock.cpp'
+          rb.write_text(rb_src.replace(rb_start_old, rb_start_new, 1))
+
+          ld = Path('UniXNU/drivers/GopFramebuffer/NativeLegacyDisplay.cpp')
+          ld_src = ld.read_text()
+          ld_head_old = 'extern "C" bool native_legacy_prepare_scanout(void);'
+          ld_head_new = '\n'.join([
+              'extern "C" bool native_legacy_prepare_scanout(void);',
+              '#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS',
+              'extern "C" void sheng_backlight_set_nits(int32_t fixed) __attribute__((weak_import));',
+              'static inline int32_t swapNitsFixed(uint64_t bits) {',
+              '    const uint32_t exponent = uint32_t(bits >> 52) & 0x7ffu;',
+              '    if ((bits >> 63) || exponent == 0 || exponent == 0x7ffu) return 0;',
+              '    const uint64_t mantissa = (bits & ((uint64_t(1) << 52) - 1)) | (uint64_t(1) << 52);',
+              '    const int shift = int(exponent) - 1075 + 16;',
+              '    if (shift >= 0) return shift > 10 ? INT32_MAX : (mantissa << shift) > uint64_t(INT32_MAX) ? INT32_MAX : int32_t(mantissa << shift);',
+              '    return shift <= -64 ? 0 : (mantissa >> -shift) > uint64_t(INT32_MAX) ? INT32_MAX : int32_t(mantissa >> -shift);',
+              '}',
+              '#endif',
+          ])
+          assert ld_head_old in ld_src, 'missing head anchor in NativeLegacyDisplay.cpp'
+          ld_src = ld_src.replace(ld_head_old, ld_head_new, 1)
+          ld_mem_old = '    uint64_t validatedAt[8];   // no initializer: IOKit objects are allocated zeroed'
+          ld_mem_new = '\n'.join([
+              '#if defined(NATIVE_LEGACY_MACOS) && NATIVE_LEGACY_MACOS',
+              '    int32_t lastSwapNits;',
+              '#endif',
+              '    uint64_t validatedAt[8];   // no initializer: IOKit objects are allocated zeroed',
+          ])
+          assert ld_mem_old in ld_src, 'missing validatedAt in NativeLegacyDisplay.cpp'
+          ld_src = ld_src.replace(ld_mem_old, ld_mem_new, 1)
+          ld_swap_old = '    IOReturn swapSetColorMatrix(void *,uint32_t,uint32_t) override {return kIOReturnSuccess;}\n#endif'
+          ld_swap_new = '\n'.join([
+              '    IOReturn swapSetColorMatrix(void *,uint32_t,uint32_t) override {return kIOReturnSuccess;}',
+              '    IOReturn swap_submit(void *rec, void *client, uint32_t *out) override {',
+              '        if (rec && sheng_backlight_set_nits) {',
+              '            const uint8_t *b = static_cast<const uint8_t *>(rec);',
+              '            if (b[0x3b4] & 1u) {',
+              '                uint64_t bits = 0;',
+              '                memcpy(&bits, b + 0x3be, sizeof bits);',
+              '                const int32_t fixed = swapNitsFixed(bits);',
+              '                if (fixed >= (2 << 16) && fixed <= (1000 << 16) && fixed != lastSwapNits) {',
+              '                    lastSwapNits = fixed;',
+              '                    sheng_backlight_set_nits(fixed);',
+              '                }',
+              '            }',
+              '        }',
+              '        return IOMobileFramebufferLegacy::swap_submit(rec, client, out);',
+              '    }',
+              '#endif',
+          ])
+          assert ld_swap_old in ld_src, 'missing swapSetColorMatrix in NativeLegacyDisplay.cpp'
+          ld.write_text(ld_src.replace(ld_swap_old, ld_swap_new, 1))
+          print('Applied Stage 1, Stage 2, and Stage 3 patches.')
           PY
       - name: Refresh pinned translator checkout
         run: |
@@ -237,7 +487,7 @@ jobs:
               h.update(rel.encode() + b'\n')
               h.update((core / rel).read_bytes())
           signature = h.hexdigest()
-          stamp = tree / '.cache/unixnu-mesa-patch.sha256'
+          stamp = tree / '.cache/gpu-reference/unixnu-mesa-patch.sha256'
           if source.exists():
               actual = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
               if actual != pin or not stamp.exists() or stamp.read_text().strip() != signature:
@@ -247,6 +497,11 @@ jobs:
           stamp.parent.mkdir(parents=True, exist_ok=True)
           stamp.write_text(signature + '\n')
           PYTHON
+      - name: Run host tests
+        run: |
+          python3 device/scripts/check-keyboard-service-host.py
+          python3 device/scripts/check-keyboard-cover-host.py
+          python3 device/scripts/check-lid-clamshell-host.py
       - name: Install build tools
         run: |
           brew install dtc llvm lld llvm@22 lld@22 cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup unifdef openssl@3 zstd blacktop/tap/ipsw
@@ -299,6 +554,19 @@ jobs:
           else
             python3 ../device/scripts/prepare-macos-install.py --reuse-policies
           fi
+      - name: Verify pinned Data seed
+        if: ${{ !inputs.root_storage }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          p = Path('UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime/data.dbr')
+          assert p.exists(), f'missing {p}'
+          got = hashlib.sha256(p.read_bytes()).hexdigest()
+          want = 'd07387ed3b72982fccd43b776e310b0dbf4a6ff0cc7fc886388ed5d6dcba00eb'
+          assert got == want, f'data.dbr SHA-256 mismatch: got {got}, want {want}'
+          print(f'Verified pinned data.dbr SHA-256: {got}')
+          PY
       - name: Build images
         id: build-images
         working-directory: device
@@ -367,13 +635,18 @@ jobs:
             UniXNU/out/feeds
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/gpu-reference
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/mesa-work
-            UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/.cache/unixnu-mesa-patch.sha256
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/adreno-metal-bridge
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/m2v-target
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/tree/build/mesa-tu-macos27
             UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime/data.dbr
             device/drivers/Ath12kWifi/deps
             device/.cache/firmware
+      - name: Save pinned Data seed
+        if: always() && !inputs.root_storage && steps.build-images.outcome == 'success' && steps.data-seed-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: sheng-macos27-data-seed-9A4D30E4
+          path: UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos/runtime/data.dbr
       - name: Save kernel compile records
         if: always() && steps.build-images.outcome == 'success' && steps.kernel-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4

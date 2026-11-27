@@ -46,6 +46,8 @@ extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint3
 // The frames the display shows (GopFramebuffer NativeLegacyDisplay.cpp): [7] copies, [9] flips, [10] latches.
 extern "C" volatile uint32_t native_legacy_swapstat[16] __attribute__((weak_import));
 
+class ShengBacklight;
+
 namespace {
 constexpr uint64_t kGcc = 0x100000, kSeA = 0xa84000, kSeB = 0x988000;
 constexpr uint32_t kSpi[2] = {354, 466};
@@ -63,6 +65,11 @@ struct Window {IOMemoryMap *map; volatile uint32_t *va;};
 Window gGcc, gSe[2];
 volatile uint32_t gIrqStatus[2];
 IOInterruptEventSource *volatile gInbox;
+ShengBacklight *volatile gBacklight = nullptr;
+volatile uint32_t gLastLevel = 0;
+volatile uint32_t gDirectSetProps = 0;
+volatile uint32_t gSwapNitsActive = 0;
+volatile uint32_t gSetPropsLogCount = 0;
 // The newest brightness asked for: goal << 16 | fade milliseconds, with bit 63 set while the work loop has not taken it.
 volatile uint64_t gRequest;
 // 1 while the keyboard cover's lid is closed (sheng_backlight_lid): the level written to the panel is none (LidClamshell.h).
@@ -425,12 +432,21 @@ class ShengBacklight : public IOService {
         uint32_t control = 1;
         PE_parse_boot_argn("backlight-control", &control, sizeof control);
         // backboardd's sandbox profile refuses FadePeriod on this service (int-276), and CoreBrightness sends it with every brightness:
-        // the grant (patches/xnu/zzwb-native-sandbox-grant-set-properties.patch) lets backboardd alone set its properties, which
-        // setProperties checks itself.
-        if (control == 1 && impersonate()) {setProperty("NativeSandboxGrantProcess", "backboardd"); setProperty("backlight-control", true);}
+        // the grant (patches/xnu/zzwb-native-sandbox-grant-set-properties.patch) lets backboardd/WindowServer/corebrightnessd set its properties.
+        if (control == 1 && impersonate()) {
+            static const uint8_t kForceOverride = 1;
+            if (OSData *force = OSData::withBytes(&kForceOverride, sizeof kForceOverride)) {
+                setProperty("force-brightness-control", force);
+                force->release();
+            }
+            setProperty("NativeSandboxGrantProcess", "backboardd,WindowServer,corebrightnessd");
+            setProperty("backlight-control", true);
+        }
         const bool impersonated = control == 1 && gAppleClass;
         publishCalibration();
         publish(level);
+        __atomic_store_n(&gLastLevel, level, __ATOMIC_RELEASE);
+        __atomic_store_n(&gBacklight, this, __ATOMIC_RELEASE);
         registerService();
         native_backlight_stats[0] = impersonated ? 4 : 3;
         // A lid closed before the service was up: the panel goes dark now, with the level read kept as the one shown.
@@ -476,24 +492,24 @@ public:
         const uint64_t scaled = ((uint64_t)fixed * kMaxLevel + scale / 2) / scale;
         return scaled < 1 ? 1 : scaled > kMaxLevel ? kMaxLevel : (uint32_t)scaled;
     }
-    IOReturn setProperties(OSObject *properties) override {
-        OSDictionary *dictionary = OSDynamicCast(OSDictionary, properties);
-        if (!dictionary) return kIOReturnBadArgument;
-        // iPadOS 27 sends signed 16.16 nits and ramps them itself (zero or less is the display going dark); iPadOS 17 sends a level and a
-        // fade period in 16.16 seconds.
-        uint32_t goal;
-        uint64_t milliseconds = 0;
-        if (OSNumber *nits = OSDynamicCast(OSNumber, dictionary->getObject("brightness-nits"))) {
-            goal = levelForNits((int32_t)nits->unsigned32BitValue());
-        } else if (OSNumber *brightness = OSDynamicCast(OSNumber, dictionary->getObject("brightness"))) {
-            OSNumber *fadePeriod = OSDynamicCast(OSNumber, dictionary->getObject("FadePeriod"));
-            const int32_t requested = (int32_t)brightness->unsigned32BitValue();
-            goal = requested < 0 ? 0 : (uint32_t)requested > kMaxLevel ? kMaxLevel : (uint32_t)requested;
-            milliseconds = fadePeriod ? ((uint64_t)fadePeriod->unsigned32BitValue() * 1000) >> 16 : 0;
-            if (milliseconds > 5000) milliseconds = 5000;
-        } else {
-            return kIOReturnSuccess;
+    static uint32_t steppedLevel(uint32_t current, int delta) {
+        static constexpr uint32_t kSteps[] = {64, 96, 136, 184, 244, 316, 404, 512, 640, 792, 972, 1184, 1432, 1620, 1824, kMaxLevel};
+        constexpr int kCount = (int)(sizeof kSteps / sizeof kSteps[0]);
+        int nearest = 0;
+        uint32_t bestDiff = current > kSteps[0] ? current - kSteps[0] : kSteps[0] - current;
+        for (int i = 1; i < kCount; ++i) {
+            const uint32_t d = current > kSteps[i] ? current - kSteps[i] : kSteps[i] - current;
+            if (d < bestDiff) {bestDiff = d; nearest = i;}
         }
+        int idx = nearest + delta;
+        if (idx < 0) idx = 0;
+        if (idx >= kCount) idx = kCount - 1;
+        return kSteps[idx];
+    }
+    void queueLevel(uint32_t goal, uint32_t milliseconds) {
+        if (goal > kMaxLevel) goal = kMaxLevel;
+        if (milliseconds > 5000) milliseconds = 5000;
+        __atomic_store_n(&gLastLevel, goal, __ATOMIC_RELEASE);
         bump(1);
         native_backlight_request[0] = (int32_t)goal;
         native_backlight_request[1] = (int32_t)milliseconds;
@@ -503,6 +519,38 @@ public:
         __atomic_store_n(&gRequest, 1ull << 63 | (uint64_t)goal << 16 | milliseconds, __ATOMIC_RELEASE);
         request->setTimeoutUS(1);
         publish(goal);
+    }
+    IOReturn setProperties(OSObject *properties) override {
+        OSDictionary *dictionary = OSDynamicCast(OSDictionary, properties);
+        if (!dictionary) return kIOReturnBadArgument;
+        // iPadOS/macOS 27 sends signed 16.16 nits and ramps them itself (zero or less is the display going dark); older CoreBrightness
+        // sends a level and a fade period in 16.16 seconds.
+        uint32_t goal;
+        uint64_t milliseconds = 0;
+        const char *source = nullptr;
+        if (OSNumber *nits = OSDynamicCast(OSNumber, dictionary->getObject("brightness-nits"))) {
+            goal = levelForNits((int32_t)nits->unsigned32BitValue());
+            source = "brightness-nits";
+            __atomic_store_n(&gDirectSetProps, 1u, __ATOMIC_RELEASE);
+        } else if (OSNumber *brightness = OSDynamicCast(OSNumber, dictionary->getObject("brightness"))) {
+            OSNumber *fadePeriod = OSDynamicCast(OSNumber, dictionary->getObject("FadePeriod"));
+            const int32_t requested = (int32_t)brightness->unsigned32BitValue();
+            goal = requested < 0 ? 0 : (uint32_t)requested > kMaxLevel ? kMaxLevel : (uint32_t)requested;
+            milliseconds = fadePeriod ? ((uint64_t)fadePeriod->unsigned32BitValue() * 1000) >> 16 : 0;
+            source = "brightness";
+            __atomic_store_n(&gDirectSetProps, 1u, __ATOMIC_RELEASE);
+        } else if (OSNumber *step = OSDynamicCast(OSNumber, dictionary->getObject("brightness-step"))) {
+            const int32_t delta = (int32_t)step->unsigned32BitValue();
+            if (!delta) return kIOReturnSuccess;
+            goal = steppedLevel(__atomic_load_n(&gLastLevel, __ATOMIC_ACQUIRE), delta);
+            milliseconds = 60;
+            source = "brightness-step";
+        } else {
+            return kIOReturnSuccess;
+        }
+        const uint32_t logged = __atomic_fetch_add(&gSetPropsLogCount, 1u, __ATOMIC_RELAXED);
+        if (logged < 8) IOLog("sheng backlight: %s -> level %u (%llu ms)\n", source, goal, (unsigned long long)milliseconds);
+        queueLevel(goal, (uint32_t)milliseconds);
         return kIOReturnSuccess;
     }
 };
@@ -529,6 +577,26 @@ extern "C" void sheng_backlight_lid(bool closed) {
     __atomic_store_n(&gLidClosed, closed ? 1u : 0u, __ATOMIC_RELEASE);
     IOLog("sheng backlight: lid %s, panel %s\n", closed ? "closed" : "open", closed ? "dark" : "back to its level");
     if (IOTimerEventSource *timer = gLidTimer) timer->setTimeoutUS(1);
+}
+
+// Swap-path brightness adapter (GopFramebuffer NativeLegacyDisplay swap_submit): used when CoreBrightness did not call setProperties directly.
+extern "C" void sheng_backlight_set_nits(int32_t fixed) {
+    if (fixed <= 0 || __atomic_load_n(&gDirectSetProps, __ATOMIC_ACQUIRE)) return;
+    ShengBacklight *bl = __atomic_load_n(&gBacklight, __ATOMIC_ACQUIRE);
+    if (!bl) return;
+    __atomic_store_n(&gSwapNitsActive, 1u, __ATOMIC_RELEASE);
+    const uint32_t goal = ShengBacklight::levelForNits(fixed);
+    if (goal == __atomic_load_n(&gLastLevel, __ATOMIC_ACQUIRE)) return;
+    bl->queueLevel(goal, 0);
+}
+
+// Kernel-side brightness key step (KeyboardProbe.cpp): steps along the perceptual 16-level table.
+extern "C" void sheng_backlight_step(int delta) {
+    if (!delta || __atomic_load_n(&gDirectSetProps, __ATOMIC_ACQUIRE) || __atomic_load_n(&gSwapNitsActive, __ATOMIC_ACQUIRE)) return;
+    ShengBacklight *bl = __atomic_load_n(&gBacklight, __ATOMIC_ACQUIRE);
+    if (!bl) return;
+    const uint32_t cur = __atomic_load_n(&gLastLevel, __ATOMIC_ACQUIRE);
+    bl->queueLevel(ShengBacklight::steppedLevel(cur, delta), 60);
 }
 
 // Called by BacklightProbe.cpp once this file's classes are registered (its static initializer runs between preModLoad and postModLoad).

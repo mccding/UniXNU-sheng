@@ -1968,7 +1968,8 @@
   "setGammaTable": 307,
   "setColorRemapMode": 312,
   "getColorRemapMode": 313,
-  "swapSetColorMatrix": 343
+  "swapSetColorMatrix": 343,
+  "swap_submit": 284
  },
  "leaves": [],
  "prototypes": {
@@ -1996,7 +1997,8 @@
   "setGammaTable": "IOReturn setGammaTable(void *)",
   "setColorRemapMode": "IOReturn setColorRemapMode(uint32_t)",
   "getColorRemapMode": "IOReturn getColorRemapMode(uint32_t *)",
-  "swapSetColorMatrix": "IOReturn swapSetColorMatrix(void *,uint32_t,uint32_t)"
+  "swapSetColorMatrix": "IOReturn swapSetColorMatrix(void *,uint32_t,uint32_t)",
+  "swap_submit": "IOReturn swap_submit(void *,void *,uint32_t *)"
  },
  "bindings": {
   "__ZN25IOMobileFramebufferLegacyC2EPK11OSMetaClass": "0xfffffe000ac244b4",
@@ -2017,7 +2019,8 @@
   "_native_legacy_ioav_timing": "0xfffffe000a7e8d68",
   "_native_legacy_ioav_timing_colors": "0xfffffe000a7ea2ac",
   "_native_legacy_ioav_color": "0xfffffe000a7e80c0",
-  "_native_legacy_hotplug_notify": "0xfffffe000ac2e954"
+  "_native_legacy_hotplug_notify": "0xfffffe000ac2e954",
+  "__ZN25IOMobileFramebufferLegacy16swapSubmit_76466EPvS0_Pj": "0xfffffe000ac29dc4"
  },
  "checks": [
   [
@@ -2124,9 +2127,9 @@
    "opaque283_113506",
    "Ev"
   ],
-  "opaque284": [
-   "opaque284_200011",
-   "Ev"
+  "swap_submit": [
+   "swapSubmit_76466",
+   "EPvS0_Pj"
   ],
   "opaque285": [
    "opaque285_116826",

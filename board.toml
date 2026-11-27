@@ -247,7 +247,12 @@ ramdisk_max_bytes = 199229440
 # `tbnz w8, #0` while CADeviceIsVirtualized is set (vmm-present). The branch becomes a NOP as a fixup of signed text, applied when
 # the page passes code signing validation; a write into the mapped page (the plugin's former ca-fb-8bit) made the page invalid and
 # code signing killed WindowServer.
-"text_fixups" = ["dyld_shared_cache_arm64e.03,5de1134,08060037,1f2003d5"]
+"text_fixups" = [
+    "dyld_shared_cache_arm64e.03,5de1134,08060037,1f2003d5",
+    # CoreBrightness -[BrightnessSystemInternal init] forces Mode 3 (VMBLControl) when vmm-present=1;
+    # switch `movz w8, #0x3` -> `movz w8, #0x1` so physical BLControl attaches AppleARMBacklight while keeping vmm-present=1.
+    "dyld_shared_cache_arm64e.15,63b7ca8,68008052,28008052",
+]
 
 ["os_overrides"."macos-27.3-26C5035r"."payload"."install"]
 "title" = "Initialize macOS Data and boot"

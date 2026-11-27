@@ -9,10 +9,11 @@ static unsigned checks;
 struct Mock {
     uint64_t clock = 1;
     uint32_t edges = 0, reads = 0, powers = 0, applies = 0, wakes = 0, releases = 0, reloads = 0, consumedCount = 0;
-    bool on = true, readOK = true, powerOK = true, applyOK = true, recoverOK = true, flood = false;
+    bool on = true, readOK = true, powerOK = true, applyOK = true, recoverOK = true, flood = false, lineHigh = false;
     KeyboardService *service = nullptr;
     uint64_t now() const {return clock;}
     uint32_t irqs() const {return edges;}
+    bool irqHigh() const {return lineHigh;}
     bool attached() const {return on;}
     bool read() {++reads; ++clock; if (flood) ++edges; return readOK;}
     void consumed(uint32_t seen) {consumedCount = seen;}
@@ -83,5 +84,15 @@ int main() {
 
     // Counter wrap remains a single pending event.
     s.seen = UINT32_MAX; io.edges = 0; s.step(io); CHECK(!s.seen && !io.consumedCount);
+
+    // Stuck-high IRQ line drains up to drainBudget even without new edge pulses, and respects retryDue on read errors.
+    io.lineHigh = true;
+    const uint32_t highReadsBefore = io.reads;
+    s.step(io);
+    CHECK(io.reads == highReadsBefore + KeyboardService::drainBudget && s.deadline(io.clock, io.edges, io.irqHigh()) == io.clock);
+    io.readOK = false;
+    s.step(io);
+    CHECK(io.reads == highReadsBefore + KeyboardService::drainBudget + 1 && s.retryDue > io.clock);
+    io.lineHigh = false; io.readOK = true; s.retryDue = 0; s.readFailures = 0;
     std::printf("PASS keyboard service: %u checks\n", checks);
 }

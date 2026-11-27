@@ -40,6 +40,9 @@ extern "C" {
 #include "LidClamshell.h"
 #endif
 }
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+#include <IOKit/IOMessage.h>
+#endif
 
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
@@ -49,6 +52,7 @@ extern "C" void sheng_keyboard_cover_input(IOService *, const uint8_t *, uint32_
 extern "C" void sheng_keyboard_cover_enable(IOService *, bool);
 extern "C" void sheng_keyboard_cover_output_sink(void (*)(void *, uint8_t), void *);
 extern "C" void sheng_battery_keyboard_attached(int) __attribute__((weak_import));
+extern "C" void sheng_backlight_step(int) __attribute__((weak_import));
 extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 extern "C" int armcpu_spi_share(uint32_t, void (*)(void *), void *) __attribute__((weak_import));
 extern "C" bool sm8550_gcc_update32(volatile uint32_t *, uint32_t, uint32_t) __attribute__((weak_import));
@@ -136,10 +140,13 @@ struct Keyboard {
     volatile int busResult;
     volatile uint32_t mcuIrqs, hallIrqs;
     volatile uint32_t capsWanted, capsRequests;
+    volatile uint32_t irqEmpty, wakeRequested;
     // Thread state.
     uint32_t hallSeen, capsSeen;
-    bool attached, inputEnabled, lid, tablet, caps, hallPending, detachPending;
-    uint64_t hallDue, hallPoll, detachDueMs;   // milliseconds
+    uint32_t hidRetries;
+    bool attached, inputEnabled, lid, tablet, caps, hallPending, detachPending, sleepRegistered;
+    uint8_t rctrlBrightness;
+    uint64_t hallDue, hallPoll, detachDueMs, hidRetryDue;   // milliseconds
     KeyboardService service;
     IOService *hid;
     bool classRegistered;
@@ -176,6 +183,7 @@ void tlmmIrq(void *) {
     bool wake = false;
     if (rd32(pin(PinIrq), kIntrStatus) & 1u) {
         wr32(pin(PinIrq), kIntrStatus, 0);
+        __atomic_store_n(&kb->irqEmpty, 0u, __ATOMIC_RELEASE);
         __atomic_fetch_add(&kb->mcuIrqs, 1, __ATOMIC_RELEASE);
         wake = true;
     }
@@ -405,6 +413,7 @@ bool loadImage() {
     if (verified != Wn8030RomVerified) return fail(6, 0x200 | (verified & 0xff));
     // Edges of the interrupt line before the firmware runs are not frames.
     kb->service.seen = __atomic_load_n(&kb->mcuIrqs, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&kb->irqEmpty, 0u, __ATOMIC_RELEASE);
     if (!romWrite(WN8030_ROM_BOOT)) return fail(6, -12);
     IOSleep(50);
     native_keyboard_stats[4] = (int32_t)(nowMs() - start);
@@ -453,6 +462,7 @@ IOService *createHid() {
 void releaseInputs() {
     uint8_t keyboard[WN8030_KEYBOARD_REPORT], consumer[WN8030_CONSUMER_REPORT], touchpad[WN8030_TOUCHPAD_REPORT];
     wn8030_release_reports(keyboard, consumer, touchpad);
+    gKb->rctrlBrightness = 0;
     IOService *hid = gKb->hid;
     if (!hid) return;
     sheng_keyboard_cover_input(hid, keyboard, sizeof keyboard);
@@ -479,8 +489,14 @@ void attachCover() {
     kb->caps = false;                 // the controller keeps the Caps Lock LED between attaches; the system starts with it off
     kb->service.statePending = true;
     if (!kb->hid) kb->hid = createHid();
-    if (kb->hid) sheng_keyboard_cover_enable(kb->hid, kb->inputEnabled);
-    else bump(8, 1 << 24);
+    if (kb->hid) {
+        kb->hidRetries = 0;
+        kb->hidRetryDue = 0;
+        sheng_keyboard_cover_enable(kb->hid, kb->inputEnabled);
+    } else {
+        bump(8, 1 << 24);
+        kb->hidRetryDue = nowMs() + 2000;
+    }
     kb->service.keepalive = nowMs();
     if (sheng_battery_keyboard_attached) sheng_battery_keyboard_attached(1);
     native_keyboard_stats[8] = (native_keyboard_stats[8] & ~0xff) + 0x100 + 1;
@@ -574,6 +590,7 @@ bool handleFrame() {
     bump(6);
     Wn8030Frame f;
     const int kind = wn8030_parse(kb->frame, &f);
+    __atomic_store_n(&kb->irqEmpty, kind == Wn8030Invalid ? 1u : 0u, __ATOMIC_RELEASE);
     const uint32_t now = static_cast<uint32_t>(nowMs());
     if (kind == Wn8030Attach) {
         if (f.attached == 1 && !kb->attached) logAttach("attached", now);
@@ -583,8 +600,19 @@ bool handleFrame() {
     kb_trace_push(&kb->trace, now, traceKind(kind));
     switch (kind) {
     case Wn8030Keyboard: case Wn8030Consumer: case Wn8030Touchpad:
+        if (kb->detachPending || !kb->attached) {
+            const bool wasDetachPending = kb->detachPending;
+            kb->detachPending = false;
+            if (!kb->attached) attachCover();
+            else if (wasDetachPending) kb->service.statePending = true;
+        }
         if (kb->hid && kb->inputEnabled) {
             uint8_t touchpad[WN8030_TOUCHPAD_REPORT];
+            uint8_t kbdCopy[WN8030_KEYBOARD_REPORT];
+            uint8_t synthConsumer[WN8030_CONSUMER_REPORT] = {WN8030_CONSUMER_ID, 0, 0};
+            const uint8_t *reportOut = f.report;
+            bool sendSynth = false;
+            int stepBrightness = 0;
             if (f.kind == Wn8030Touchpad) {
                 for (uint32_t i = 0; i < WN8030_TOUCHPAD_FINGERS; ++i) {
                     const uint8_t *finger = f.report + 2 + 6 * i;
@@ -597,16 +625,47 @@ bool handleFrame() {
                     if (y > r[3]) r[3] = y;
                 }
                 bump(16, (int32_t)wn8030_touchpad_report(f.report, touchpad));
+                reportOut = touchpad;
+            } else if (f.kind == Wn8030Consumer && f.length >= WN8030_CONSUMER_REPORT) {
+                const uint16_t usage = (uint16_t)f.report[1] | ((uint16_t)f.report[2] << 8);
+                if (usage == 0x006f) stepBrightness = 1;
+                else if (usage == 0x0070) stepBrightness = -1;
+            } else if (f.kind == Wn8030Keyboard && f.length >= WN8030_KEYBOARD_REPORT) {
+                memcpy(kbdCopy, f.report, WN8030_KEYBOARD_REPORT);
+                const bool rctrl = (kbdCopy[1] & 0x10u) != 0;
+                uint8_t cur = 0;
+                for (unsigned i = 3; i < WN8030_KEYBOARD_REPORT; ++i) {
+                    if (rctrl && kbdCopy[i] == 0x1e) {cur |= 1u; kbdCopy[i] = 0;}
+                    else if (rctrl && kbdCopy[i] == 0x1f) {cur |= 2u; kbdCopy[i] = 0;}
+                }
+                if (cur) reportOut = kbdCopy;
+                if ((cur & 1u) && !(kb->rctrlBrightness & 1u)) stepBrightness = -1;
+                else if ((cur & 2u) && !(kb->rctrlBrightness & 2u)) stepBrightness = 1;
+                if (cur != kb->rctrlBrightness) {
+                    if ((cur & 1u) && (stepBrightness < 0 || !(cur & 2u))) {sendSynth = true; synthConsumer[1] = 0x70;}
+                    else if ((cur & 2u) && (stepBrightness > 0 || !(cur & 1u))) {sendSynth = true; synthConsumer[1] = 0x6f;}
+                    else if (!cur && kb->rctrlBrightness) sendSynth = true;
+                }
+                kb->rctrlBrightness = cur;
             }
-            sheng_keyboard_cover_input(kb->hid, f.kind == Wn8030Touchpad ? touchpad : f.report, f.length);
+            sheng_keyboard_cover_input(kb->hid, reportOut, f.length);
+            if (sendSynth) sheng_keyboard_cover_input(kb->hid, synthConsumer, WN8030_CONSUMER_REPORT);
+            if (stepBrightness && sheng_backlight_step) sheng_backlight_step(stepBrightness);
             bump(7, f.kind == Wn8030Keyboard ? 1 : f.kind == Wn8030Consumer ? 0x100 : 0x10000);
         }
         break;
     case Wn8030Attach:
         if (f.attached == 1) {
+            const bool wasDetachPending = kb->detachPending;
             kb->detachPending = false;
             if (!kb->attached) attachCover();
-            else if (sheng_battery_keyboard_attached) sheng_battery_keyboard_attached(1);
+            else {
+                if (wasDetachPending) {
+                    kb->service.statePending = true;
+                    kb->service.keepalive = nowMs();
+                }
+                if (sheng_battery_keyboard_attached) sheng_battery_keyboard_attached(1);
+            }
         } else if (f.attached == 0 && kb->attached) {
             releaseInputs();
             if (!kb->detachPending) {
@@ -650,6 +709,7 @@ bool recoverController() {
     const int prepared = geni_i2c_prepare(&kb->bus, &io, WN8030_ADDRESS, &config);
     IOSimpleLockUnlockEnableInterrupt(kb->busLock, state);
     if (prepared || !powerOn() || !loadImage()) return false;
+    __atomic_store_n(&kb->irqEmpty, 0u, __ATOMIC_RELEASE);
     stage(7);
     return true;
 }
@@ -657,6 +717,7 @@ bool recoverController() {
 struct KeyboardIO {
     uint64_t now() const {return nowMs();}
     uint32_t irqs() const {return __atomic_load_n(&gKb->mcuIrqs, __ATOMIC_ACQUIRE);}
+    bool irqHigh() const {return level(PinIrq) && !__atomic_load_n(&gKb->irqEmpty, __ATOMIC_ACQUIRE);}
     bool attached() const {return gKb->attached;}
     bool read() const {return handleFrame();}
     void consumed(uint32_t seen) const {native_keyboard_stats[5] = (int32_t)seen;}
@@ -666,6 +727,7 @@ struct KeyboardIO {
     void wake() const {
         IOLog(kKeepAwakeFailureLog,
               native_keyboard_stats[11], native_keyboard_stats[13]);
+        __atomic_store_n(&gKb->irqEmpty, 0u, __ATOMIC_RELEASE);
         setOutput(PinSleep, false); IOSleep(10);
         setOutput(PinSleep, true); IOSleep(25);
     }
@@ -682,12 +744,36 @@ struct KeyboardIO {
     }
 };
 
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+IOReturn keyboardSleepWake(void *, void *, natural_t message, IOService *, void *, vm_size_t) {
+    if ((message == kIOMessageSystemWillPowerOn || message == kIOMessageSystemHasPoweredOn) && gKb) {
+        __atomic_store_n(&gKb->wakeRequested, 1u, __ATOMIC_RELEASE);
+        thread_wakeup((event_t)&gWake);
+    }
+    return kIOReturnSuccess;
+}
+#endif
+
 void serve() {
     Keyboard *kb = gKb;
     KeyboardIO io;
     kb->hallPoll = nowMs() + kHallPollMs;
-    kb->service.keepalive = nowMs() + KeyboardService::keepaliveMs;
+    kb->service.keepalive = nowMs() + 500;
     for (;;) {
+#if defined(XNU_TARGET_OS_OSX) && XNU_TARGET_OS_OSX
+        if (!kb->sleepRegistered && IOService::getPMRootDomain()) {
+            kb->sleepRegistered = registerSleepWakeInterest(keyboardSleepWake, nullptr, nullptr) != nullptr;
+        }
+        if (__atomic_exchange_n(&kb->wakeRequested, 0u, __ATOMIC_ACQ_REL)) {
+            __atomic_store_n(&kb->irqEmpty, 0u, __ATOMIC_RELEASE);
+            if (kb->attached) {
+                setOutput(PinSleep, false); IOSleep(10);
+                setOutput(PinSleep, true); IOSleep(25);
+                kb->service.statePending = true;
+            }
+            kb->service.keepalive = nowMs();
+        }
+#endif
         const uint32_t hall = __atomic_load_n(&kb->hallIrqs, __ATOMIC_ACQUIRE);
         if (hall != kb->hallSeen) {
             kb->hallSeen = hall;
@@ -699,6 +785,19 @@ void serve() {
         if (kb->detachPending && now >= kb->detachDueMs) {
             kb->detachPending = false;
             if (kb->attached) detachCover();
+        }
+        if (kb->attached && !kb->hid && kb->hidRetries < 30 && now >= kb->hidRetryDue) {
+            ++kb->hidRetries;
+            kb->hid = createHid();
+            if (kb->hid) {
+                kb->hidRetryDue = 0;
+                sheng_keyboard_cover_enable(kb->hid, kb->inputEnabled);
+                kb->service.statePending = true;
+            } else if (kb->hidRetries < 30) {
+                kb->hidRetryDue = nowMs() + 2000;
+            } else {
+                kb->hidRetryDue = 0;
+            }
         }
         if ((kb->hallPending && now >= kb->hallDue) || (!kb->hallPending && now >= kb->hallPoll)) {
             kb->hallPending = false;
@@ -712,16 +811,19 @@ void serve() {
             kb->service.statePending = kb->attached;
         }
         kb->service.step(io);
-        const uint64_t next = kb->service.deadline(nowMs(), io.irqs());
+        const uint64_t next = kb->service.deadline(nowMs(), io.irqs(), io.irqHigh());
         const uint64_t hallDeadline = kb->hallPending ? kb->hallDue : kb->hallPoll;
         uint64_t due = next < hallDeadline ? next : hallDeadline;
         if (kb->detachPending && kb->detachDueMs < due) due = kb->detachDueMs;
+        if (kb->attached && !kb->hid && kb->hidRetries < 30 && kb->hidRetryDue < due) due = kb->hidRetryDue;
         const uint64_t current = nowMs();
         assert_wait_deadline((event_t)&gWake, THREAD_UNINT, deadlineMs(due > current ? (uint32_t)(due - current) : 1));
-        if (kb->service.deadline(nowMs(), io.irqs()) <= nowMs() ||
+        if (kb->service.deadline(nowMs(), io.irqs(), io.irqHigh()) <= nowMs() ||
             kb->hallSeen != __atomic_load_n(&kb->hallIrqs, __ATOMIC_ACQUIRE) ||
             kb->capsSeen != __atomic_load_n(&kb->capsRequests, __ATOMIC_ACQUIRE) ||
-            (kb->detachPending && nowMs() >= kb->detachDueMs))
+            __atomic_load_n(&kb->wakeRequested, __ATOMIC_ACQUIRE) != 0 ||
+            (kb->detachPending && nowMs() >= kb->detachDueMs) ||
+            (kb->attached && !kb->hid && kb->hidRetries < 30 && nowMs() >= kb->hidRetryDue))
             clear_wait(current_thread(), THREAD_AWAKENED);
         else thread_block(THREAD_CONTINUE_NULL);
     }
@@ -750,6 +852,7 @@ void keyboardThread(void *, wait_result_t) {
     if (!loadImage()) return;
     sheng_keyboard_cover_output_sink(ledRequest, nullptr);
     stage(7);
+    (void)control(WN8030_CMD_KEYBOARD_POWER, 1);
     publishLid(kb->lid, kb->lid);   // the state read at stage 4; serve() reads the sensor again within kHallPollMs
     serve();
 }

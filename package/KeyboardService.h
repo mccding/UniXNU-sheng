@@ -26,10 +26,12 @@ struct KeyboardService {
         }
         if (retryDue && io.now() < retryDue) return;
         retryDue = 0;
-        // A failed read keeps its edge pending. A bounded batch lets the caller service hall and LED changes under load.
-        for (unsigned n = 0; n < drainBudget && seen != io.irqs(); ++n) {
+        // A failed read keeps its edge pending. A bounded batch lets the caller service hall and LED changes under load,
+        // and continues draining while PinIrq stays high with valid frames.
+        for (unsigned n = 0; n < drainBudget && (seen != io.irqs() || io.irqHigh()); ++n) {
+            const bool hadEdge = seen != io.irqs();
             if (!io.read()) {++readFailures; retryDue = io.now() + retryMs; break;}
-            io.consumed(++seen);
+            if (hadEdge) io.consumed(++seen);
             readFailures = 0;
         }
         if (!retryDue && io.now() >= keepalive) {
@@ -57,10 +59,10 @@ struct KeyboardService {
         }
     }
 
-    uint64_t deadline(uint64_t now, uint32_t irqs) const {
+    uint64_t deadline(uint64_t now, uint32_t irqs, bool irqHigh = false) const {
         if (recovering) return recoveryDue;
         if (retryDue) return retryDue;
-        if (seen != irqs || statePending) return now;
+        if (seen != irqs || irqHigh || statePending) return now;
         return keepalive;
     }
 };
